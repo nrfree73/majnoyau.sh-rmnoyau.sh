@@ -230,18 +230,16 @@ clear
 echo ""
 
 # ==============================================================================
-# AFFICHAGE DES PAQUETS DEPUIS LE SERVEUR VIA CURL JUSTE APRÈS LA SÉLECTION
+# AFFICHAGE DES PAQUETS DEPUIS LE SERVEUR
 # ==============================================================================
-#echo "      --- Liste des paquets distants disponibles sur le serveur ---"
 echo -e "      \033[1;4;36m--- Liste des paquets distants disponibles sur le serveur ---\033[0m"
-echo
-# On interroge le sous-dossier de l'architecture pour trouver les debs spécifiques + le dossier parent pour le paquet _all.deb
+
 mapfile -t liste_debs < <(
     lynx -dump -listonly -nonumbers "${kernelURL}${arch}/" 2>/dev/null | grep -E "\.deb$"
     lynx -dump -listonly -nonumbers "${kernelURL}" 2>/dev/null | grep -E "_all\.deb$"
 )
 
-# 1. Vérification si le type choisi existe sur le serveur (ex: cherche s'il y a du lowlatency)
+# 1. Vérification si le type choisi existe sur le serveur
 if [ "$choix" == "lowlatency" ] && ! printf "%s\n" "${liste_debs[@]}" | grep -q "lowlatency"; then
     echo -e "\t\033[1;31m⚠️  Note : Pas de paquets 'lowlatency' disponibles pour ce noyau v.${site2}.\033[0m"
     echo -e "\t\033[1;31m   Bascule automatique sur la version 'generic'...\033[0m"
@@ -250,12 +248,20 @@ if [ "$choix" == "lowlatency" ] && ! printf "%s\n" "${liste_debs[@]}" | grep -q 
     low=0
 fi
 
-# 2. Tri des doublons ET filtrage strict selon le type final retenu
-for line in $(printf "%s\n" "${liste_debs[@]}" | sort -u | grep -E "(_all|$choix)"); do
+# 2. Détermination de la révision / date la plus récente disponible sur le serveur
+# On extrait la date la plus élevée (ex: 202201092355) pour le type de noyau choisi
+latest_revision=$(printf "%s\n" "${liste_debs[@]}" | grep "$choix" | grep -oE "[0-9]{12}" | sort -V | tail -1)
+
+# Si aucune révision spécifique n'est trouvée (sécurité), on prend la dernière globale
+[ -z "$latest_revision" ] && latest_revision=$(printf "%s\n" "${liste_debs[@]}" | grep -oE "[0-9]{12}" | sort -V | tail -1)
+
+# 3. Tri, filtrage strict par type ET par révision la plus récente
+for line in $(printf "%s\n" "${liste_debs[@]}" | sort -u | grep -E "(_all|$choix)" | grep "$latest_revision"); do
     echo -e "\t\033[1;3;36m-> $(basename "$line")\033[0m"
 done
 echo -e "      \033[4;36m______________________________________________________________\033[0m"
 echo ""
+
 
 
 installed=$(ls /boot |grep initrd | grep "$site2" | cut -d- -f2,3)
@@ -344,4 +350,3 @@ echo
 
 installed=$(ls /boot |grep initrd | grep "$site2" | cut -d- -f2)
 if [ -z "$installed" ]; then installed=0.0; fi
-
