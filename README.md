@@ -40,7 +40,7 @@ shc -fr .majnoyau.sh
 
 ---
 
-## 🇬🇧 English Version
+## 🇬🇧 English Version : 'update_kernel_en-v2.sh'
 
 This script automates the retrieval, selection, and installation of official Linux kernels from the Ubuntu PPA Mainline repository. It features an interactive grid GUI and advanced safety guardrails.
 
@@ -59,18 +59,18 @@ This script automates the retrieval, selection, and installation of official Lin
 ### 🚀 Usage
 ```bash
 # Make the script executable
-chmod +x .majnoyau.sh
+chmod +x update_kernel_en-v2.sh
 
 # Run the script
-./.majnoyau.sh
+bash update_kernel_en-v2.sh
 ```
 
 ### 🔒 Compile to a Binary (Optional)
 If you wish to deploy this script across a pool of machines without revealing its plaintext source code, you can compile it into a standalone binary using `shc`:
 ```bash
 sudo apt install shc gcc -y
-shc -fr .majnoyau.sh
-# Your encrypted, secure binary will be generated as: .majnoyau.sh.x
+shc -fr update_kernel_en-v2.sh
+# Your encrypted, secure binary will be generated as: update_kernel_en-v2.sh.x
 ```
 
 ---
