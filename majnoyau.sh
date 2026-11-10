@@ -6,10 +6,6 @@
 # ==============================================================================
 
 clear
-#echo "          [ Mise à jour automatisée du Noyau Linux ]  "
-#echo "              ...  RISTOVSKI Nicolas (2016-11) ..."
-#echo "                             update: (2026-11)"
-#echo ""
 
 # ==============================================================================
 # 1. GESTION DU DOSSIER TEMPORAIRE ET NETTOYAGE AUTOMATIQUE
@@ -17,7 +13,7 @@ clear
 TEMP_DIR=$(mktemp -d /tmp/kernel_update_XXXXXX)
 
 cleanup() {
-# Restaure l'affichage du curseur et l'état normal du terminal
+    # Restaure l'affichage du curseur et l'état normal du terminal
     tput cnorm 2>/dev/null
     stty sane 2>/dev/null
 
@@ -33,9 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Force l'arrêt immédiat du script lors d'un CTRL+C (ce qui déclenchera EXIT)
-trap 'echo ""; echo -e " \e[1;33mInterruption par l'\''utilisateur (CTRL+C). Nettoyage...\e[0m"; exit 130' INT TERM
-
-
+trap 'echo ""; echo -e " \033[1;33mInterruption par l'\''utilisateur (CTRL+C). Nettoyage...\033[0m"; exit 130' INT TERM
 
 # ==============================================================================
 # 2. VÉRIFICATION DU RÉSEAU ET DES DÉPENDANCES
@@ -49,12 +43,12 @@ else
 fi
 
 if [ "$network_ok" == "0" ]; then
-    echo -e "[1;31mÉCHEC[0m"
+    echo -e "\033[1;31mÉCHEC\033[0m"
     echo "Pas de réseau internet ! Mise à jour du noyau impossible... [Entrée] pour quitter."
     read -r
     exit 1
 fi
-echo -e "[1;32mOK[0m"
+echo -e "\033[1;32mOK\033[0m"
 
 # Installation des outils requis (lynx, wget, gnupg)
 MISSING_PKGS=()
@@ -92,7 +86,7 @@ else
     esac
 fi
 
-echo -e "	Architecture détectée : [1;33m$arch[0m"
+echo -e "\tArchitecture détectée : \033[1;33m$arch\033[0m"
 echo ""
 
 # ==============================================================================
@@ -102,12 +96,17 @@ BASE_URL="https://kernel.ubuntu.com/mainline/"
 echo "Récupération de la liste des versions depuis Ubuntu Mainline..."
 
 mapfile -t all_versions < <(
-    lynx -dump -listonly -nonumbers "$BASE_URL" 2>/dev/null     | grep -v "rc"     | grep -E '/v[0-9]+\.[0-9]+'     | sed 's|/$||'     | sort -uV     | sed 's|$|/|'
+    lynx -dump -listonly -nonumbers "$BASE_URL" 2>/dev/null \
+    | grep -v "rc" \
+    | grep -E '/v[0-9]+\.[0-9]+' \
+    | sed 's|/$||' \
+    | sort -uV \
+    | sed 's|$|/|'
 )
 
 total_versions=${#all_versions[@]}
 if [ "$total_versions" -eq 0 ]; then
-    echo -e "[1;31mErreur : Impossible de récupérer la liste des noyaux depuis $BASE_URL.[0m"
+    echo -e "\033[1;31mErreur : Impossible de récupérer la liste des noyaux depuis $BASE_URL.\033[0m"
     exit 1
 fi
 
@@ -127,15 +126,16 @@ load_kernel_page() {
     cols=5
     rows=$(( (num_options + cols - 1) / cols ))
 }
+
 clear
+tput civis 2>/dev/null
 load_kernel_page
 active_index=$(( num_options - 1 ))
 
-# Fonction utilitaire pour centrer une ligne de texte selon sa longueur réelle (sans codes couleurs)
+# Fonction utilitaire pour centrer une ligne de texte selon sa longueur réelle
 print_centered() {
     local text="$1"
     local plain_text
-    # Retire les séquences ANSI pour calculer la vraie longueur visuelle
     plain_text=$(echo -e "$text" | sed -r 's/\x1B\[[0-9;]*[mK]//g')
     local term_cols
     term_cols=$(tput cols 2>/dev/null || echo 120)
@@ -149,7 +149,6 @@ print_header() {
     print_centered "\033[0;37m... RISTOVSKI Nicolas (2016-11) ...\033[0m"
     print_centered "\033[0;37mupdate: (2026-11)\033[0m"
     echo ""
-    # Affiche "Architecture détectée :" en blanc gras et "$arch" en jaune vif gras
     print_centered "\033[1;37mArchitecture détectée : \033[1;33m${arch}\033[0m"
     echo ""
 }
@@ -171,8 +170,8 @@ display_menu() {
     print_header
     
     for ((r=0; r<rows; r++)); do
-        echo -ne "\033[K" # Efface la ligne avant d'écrire
-        printf "%*s" "$left_margin" "" # Applique la marge gauche pour centrer la grille
+        echo -ne "\033[K"
+        printf "%*s" "$left_margin" ""
         for ((c=0; c<cols; c++)); do
             idx=$(( r + c * rows ))
             if [ $idx -lt $num_options ]; then
@@ -191,21 +190,16 @@ display_menu() {
     echo ""
     local real_page=$(( max_pages - page_step + 1 ))
     echo -ne "\033[K"
-    print_centered "\033[1;36m---Page $real_page/$max_pages | [Flèches]: Naviguer | [-]: Précédent | [+]: Suivant | [Entrée]: Valider ---\033[0m"
+    print_centered "\033[1;36m--- Page $real_page/$max_pages | [Flèches]: Naviguer | [-]: Précédent | [+]: Suivant | [Entrée]: Valider ---\033[0m"
     
     # Efface uniquement ce qui reste en dessous
     echo -ne "\033[J"
 }
 
-
-
-
-for ((r=0; r<=rows; r++)); do echo ""; done
-
 while true; do
     display_menu
     read -rsn1 key
-    if [[ $key == $'' ]]; then
+    if [[ $key == $'\x1b' ]]; then
         read -rsn2 -t 0.1 key
         if [[ $key == "[A" ]]; then
             ((active_index--))
@@ -220,24 +214,22 @@ while true; do
         fi
     elif [[ $key == "-" ]]; then
         if [ $page_step -lt $max_pages ]; then
-            for ((r=0; r<=rows; r++)); do echo -ne "[F[K"; done
             ((page_step++))
             load_kernel_page
             active_index=0
-            for ((r=0; r<=rows; r++)); do echo ""; done
         fi
     elif [[ $key == "+" ]]; then
         if [ $page_step -gt 1 ]; then
-            for ((r=0; r<=rows; r++)); do echo -ne "[F[K"; done
             ((page_step--))
             load_kernel_page
             active_index=0
-            for ((r=0; r<=rows; r++)); do echo ""; done
         fi
     elif [[ $key == "" ]]; then
         break
     fi
 done
+
+tput cnorm 2>/dev/null
 
 # ==============================================================================
 # 5. SÉLECTION DE LA VARIANTE (GENERIC / LOWLATENCY)
@@ -248,17 +240,14 @@ kernelURL="${versions_list[$active_index]}"
 site=$(basename "$kernelURL")
 site2="${site#v}"
 
-perso="v$(uname -r | cut -d- -f1)"
-perso2=$(uname -r | cut -d- -f3)
-
-echo -e "[1m   Version sélectionnée pour installation : [1;32m$site[0m ($kernelURL)"
-echo -e "[1;36m   Version du noyau actuellement chargée  : $(uname -r)[0m"
+echo -e " \033[1m   Version sélectionnée pour installation : \033[1;32m$site\033[0m ($kernelURL)"
+echo -e " \033[1;36m   Version du noyau actuellement chargée  : $(uname -r)\033[0m"
 echo ""
-echo -e "[1;32m   Noyaux actuellement installés dans /boot :[0m"
-ls /boot 2>/dev/null | grep initrd | cut -d- -f2,3,4 | sed 's/^/	/'
+echo -e " \033[1;32m   Noyaux actuellement installés dans /boot :\033[0m"
+ls /boot 2>/dev/null | grep initrd | cut -d- -f2,3,4 | sed 's/^/\t/'
 echo ""
 
-prompt_msg=$(printf "\e[3m	Souhaitez-vous installer la variante 'lowlatency' (y/n) ? \e[0m")
+prompt_msg=$(printf "\033[3m\tSouhaitez-vous installer la variante 'lowlatency' (y/n) ? \033[0m")
 echo -ne "$prompt_msg"
 
 while true; do
@@ -273,7 +262,7 @@ echo ""
 # ==============================================================================
 # 6. RECHERCHE DES PAQUETS ET VÉRIFICATION DE DISPONIBILITÉ
 # ==============================================================================
-echo -e "   [1;4;36m--- Recherche des paquets distants sur le serveur ---[0m"
+echo -e "    \033[1;4;36m--- Recherche des paquets distants sur le serveur ---\033[0m"
 
 root_links=$(lynx -dump -listonly -nonumbers "${kernelURL}" 2>/dev/null)
 
@@ -289,14 +278,13 @@ else
 fi
 
 if [ ${#liste_debs[@]} -eq 0 ]; then
-    echo -e "	[1;31mErreur : Aucun paquet .deb trouvé pour l'architecture '$arch'.[0m"
+    echo -e "\t\033[1;31mErreur : Aucun paquet .deb trouvé pour l'architecture '$arch'.\033[0m"
     exit 1
 fi
 
-if [ "$choix" == "lowlatency" ] && ! printf "%s
-" "${liste_debs[@]}" | grep -q "lowlatency"; then
-    echo -e "	[1;31m⚠️  Note : Pas de paquets 'lowlatency' disponibles pour v.${site2}.[0m"
-    echo -e "	[1;31m   Bascule automatique sur la variante 'generic'...[0m"
+if [ "$choix" == "lowlatency" ] && ! printf "%s\n" "${liste_debs[@]}" | grep -q "lowlatency"; then
+    echo -e "\t\033[1;31m⚠️  Note : Pas de paquets 'lowlatency' disponibles pour v.${site2}.\033[0m"
+    echo -e "\t\033[1;31m   Bascule automatique sur la variante 'generic'...\033[0m"
     echo ""
     choix="generic"
     low=0
@@ -305,42 +293,43 @@ fi
 # Vérification si cette version et variante exactes sont déjà installées
 if ls /boot/initrd.img-"${site2}"*-"${choix}" >/dev/null 2>&1; then
     echo ""
-    echo -e "[1;31m   [ABANDON] Le noyau Linux $site ($choix) est déjà installé sur votre système ![0m"
+    echo -e " \033[1;31m   [ABANDON] Le noyau Linux $site ($choix) est déjà installé sur votre système !\033[0m"
     exit 0
 fi
 
 # Filtrage de la révision la plus récente et des paquets cibles
-latest_revision=$(printf "%s
-" "${liste_debs[@]}" | grep "$choix" | grep -oE "[0-9]{8,12}" | sort -V | tail -1)
-[ -z "$latest_revision" ] && latest_revision=$(printf "%s
-" "${liste_debs[@]}" | grep -oE "[0-9]{8,12}" | sort -V | tail -1)
+latest_revision=$(printf "%s\n" "${liste_debs[@]}" | grep "$choix" | grep -oE "[0-9]{8,12}" | sort -V | tail -1)
+[ -z "$latest_revision" ] && latest_revision=$(printf "%s\n" "${liste_debs[@]}" | grep -oE "[0-9]{8,12}" | sort -V | tail -1)
 
 if [ -z "$latest_revision" ]; then
     mapfile -t target_urls < <(
-        printf "%s
-" "${liste_debs[@]}" | sort -u         | grep -E "(_all\.deb|_${arch}\.deb)$"         | grep -E "(linux-headers-.*_all\.deb|${choix})"
+        printf "%s\n" "${liste_debs[@]}" | sort -u \
+        | grep -E "(_all\.deb|_${arch}\.deb)$" \
+        | grep -E "(linux-headers-.*_all\.deb|${choix})"
     )
 else
     mapfile -t target_urls < <(
-        printf "%s
-" "${liste_debs[@]}" | sort -u         | grep -E "(_all\.deb|_${arch}\.deb)$"         | grep "$latest_revision"         | grep -E "(linux-headers-.*_all\.deb|${choix})"
+        printf "%s\n" "${liste_debs[@]}" | sort -u \
+        | grep -E "(_all\.deb|_${arch}\.deb)$" \
+        | grep "$latest_revision" \
+        | grep -E "(linux-headers-.*_all\.deb|${choix})"
     )
 fi
 
 if [ ${#target_urls[@]} -eq 0 ]; then
-    echo -e "	[1;31mErreur : Impossible d'identifier les paquets à télécharger.[0m"
+    echo -e "\t\033[1;31mErreur : Impossible d'identifier les paquets à télécharger.\033[0m"
     exit 1
 fi
 
-echo -e "[1;3;32m   Noyau prêt pour téléchargement : $site ($choix)[0m"
+echo -e " \033[1;3;32m   Noyau prêt pour téléchargement : $site ($choix)\033[0m"
 for url in "${target_urls[@]}"; do
-    echo -e "	[1;3;36m-> $(basename "$url")[0m"
+    echo -e "\t\033[1;3;36m-> $(basename "$url")\033[0m"
 done
-echo -e "   [4;36m______________________________________________________________[0m"
+echo -e "    \033[4;36m______________________________________________________________\033[0m"
 echo ""
 
-echo -e "	[1;4;92m  [Entrée] pour lancer le téléchargement et la vérification GPG ![0m"
-echo -e "	[1;31m  Ou [CTRL]-[C] pour annuler et quitter...[0m"
+echo -e "\t\033[1;4;92m  [Entrée] pour lancer le téléchargement et la vérification GPG !\033[0m"
+echo -e "\t\033[1;31m  Ou [CTRL]-[C] pour annuler et quitter...\033[0m"
 
 while true; do
     read -rsn1 key
@@ -357,29 +346,29 @@ free_boot=$(df -m /boot | awk 'NR==2 {print $4}')
 free_tmp=$(df -m "$TEMP_DIR" | awk 'NR==2 {print $4}')
 
 if [ "$free_boot" -lt 150 ]; then
-    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans /boot (${free_boot} Mo libres, 150 Mo requis) ! \033[0m"
-    echo -e " \033[1;33mSupprimez d'anciens noyaux avant de continuer pour éviter de bloquer GRUB. \033[0m"
+    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans /boot (${free_boot} Mo libres, 150 Mo requis) !\033[0m"
+    echo -e " \033[1;33mSupprimez d'anciens noyaux avant de continuer pour éviter de bloquer GRUB.\033[0m"
     exit 1
 fi
 
 if [ "$free_tmp" -lt 300 ]; then
-    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans $TEMP_DIR (${free_tmp} Mo libres, 300 Mo requis) ! \033[0m"
+    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans $TEMP_DIR (${free_tmp} Mo libres, 300 Mo requis) !\033[0m"
     exit 1
 fi
 
 echo ""
-echo -e " \033[1;32m	Téléchargement des paquets dans : $TEMP_DIR \033[0m"
+echo -e " \033[1;32m\tTéléchargement des paquets dans : $TEMP_DIR\033[0m"
 echo ""
 
 for url in "${target_urls[@]}"; do
     wget -q --show-progress "$url" || {
-        echo -e " \033[1;31mErreur lors du téléchargement de $(basename "$url"). \033[0m"
+        echo -e " \033[1;31mErreur lors du téléchargement de $(basename "$url").\033[0m"
         exit 1
     }
 done
 
 echo ""
-echo -e " \033[1;36m	Vérification de l'authenticité et de l'intégrité (GPG & SHA256)... \033[0m"
+echo -e " \033[1;36m\tVérification de l'authenticité et de l'intégrité (GPG & SHA256)...\033[0m"
 
 CHECKSUM_URL=""
 if echo "$root_links" | grep -q "CHECKSUMS$"; then
@@ -400,7 +389,7 @@ if [ -n "$CHECKSUM_URL" ]; then
         [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ] && gpg --import /usr/share/keyrings/ubuntu-archive-keyring.gpg >/dev/null 2>&1
 
         # 2. Téléchargement et importation de la clé Kernel PPA
-        KS_HOST="://ubuntu.com"
+        KS_HOST="keyserver.ubuntu.com"
         UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
         curl -kfsSL "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null
         [ -s key.asc ] && gpg --import key.asc >/dev/null 2>&1
@@ -410,11 +399,11 @@ if [ -n "$CHECKSUM_URL" ]; then
         GPG_STATUS=$?
 
         if [ $GPG_STATUS -eq 0 ]; then
-            echo -e "	 \033[1;32m✔ Signature GPG valide (Kernel PPA <kernel-ppa@canonical.com>). \033[0m"
+            echo -e "\t\033[1;32m✔ Signature GPG valide (Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
         elif echo "$GPG_OUTPUT" | grep -qiE "expired|expirée"; then
-            echo -e "	 \033[1;32m✔ Signature GPG authentique (clé d'archive expirée, normal pour ce noyau). \033[0m"
+            echo -e "\t\033[1;32m✔ Signature GPG authentique (clé d'archive expirée, normal pour ce noyau).\033[0m"
         else
-            echo -e "	 \033[1;33m⚠️  Échec GPG : $(echo "$GPG_OUTPUT" | tail -n 1)\033[0m"
+            echo -e "\t\033[1;33m⚠️  Échec GPG : $(echo "$GPG_OUTPUT" | tail -n 1)\033[0m"
             read -rp "	Continuer malgré tout avec la vérification SHA256 uniquement (y/N) ? " bypass_gpg
             [[ ! "$bypass_gpg" =~ ^[yY]$ ]] && exit 1
         fi
@@ -426,23 +415,22 @@ if [ -n "$CHECKSUM_URL" ]; then
             if [ -n "$expected_sha" ]; then
                 actual_sha=$(sha256sum "$deb" | awk '{print $1}')
                 if [ "$expected_sha" == "$actual_sha" ]; then
-                    echo -e "	 \033[1;32m✔ SHA256 OK : \033[0m $deb"
+                    echo -e "\t\033[1;32m✔ SHA256 OK : \033[0m $deb"
                 else
-                    echo -e "	 \033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
+                    echo -e "\t\033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
                     sha_failed=1
                 fi
             fi
         done
 
         if [ "$sha_failed" -eq 1 ]; then
-            echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée. \033[0m"
+            echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée.\033[0m"
             exit 1
         fi
     fi
 else
-    echo -e "	 \033[1;33m⚠️  Fichiers CHECKSUMS absents pour cette version ancienne. \033[0m"
+    echo -e "\t\033[1;33m⚠️  Fichiers CHECKSUMS absents pour cette version ancienne.\033[0m"
 fi
-
 
 # ==============================================================================
 # 8. INSTALLATION DU NOUVEAU NOYAU ET MISE À JOUR DE GRUB
@@ -451,17 +439,17 @@ echo ""
 read -rp " [Entrée] pour installer le noyau $site ($choix) ou [CTRL]-[C] pour annuler... "
 echo ""
 
-echo -e " \e[1;36m	Installation des paquets .deb en cours... \e[0m"
+echo -e " \033[1;36m\tInstallation des paquets .deb en cours...\033[0m"
 if ! sudo dpkg -i *.deb; then
-    echo -e " \e[1;33m	⚠️  Dépendances manquantes détectées, tentative de réparation avec apt... \e[0m"
+    echo -e " \033[1;33m\t⚠️  Dépendances manquantes détectées, tentative de réparation avec apt...\033[0m"
     sudo apt-get install -f -y || {
-        echo -e " \e[1;31m[ERREUR] Échec de l'installation du noyau. \e[0m"
+        echo -e " \033[1;31m[ERREUR] Échec de l'installation du noyau.\033[0m"
         exit 1
     }
 fi
 
 echo ""
-echo -e " \e[1;36m	Mise à jour du chargeur d'amorçage (GRUB)... \e[0m"
+echo -e " \033[1;36m\tMise à jour du chargeur d'amorçage (GRUB)...\033[0m"
 if command -v update-grub >/dev/null 2>&1; then
     sudo update-grub
 elif command -v grub-mkconfig >/dev/null 2>&1; then
@@ -469,15 +457,14 @@ elif command -v grub-mkconfig >/dev/null 2>&1; then
 fi
 
 echo ""
-echo -e " \e[1;32m✔ Installation du noyau $site ($choix) terminée avec succès ! \e[0m"
-echo -e " \e[1;33m	Un redémarrage est nécessaire pour charger le nouveau noyau. \e[0m"
+echo -e " \033[1;32m✔ Installation du noyau $site ($choix) terminée avec succès !\033[0m"
+echo -e " \033[1;33m\tUn redémarrage est nécessaire pour charger le nouveau noyau.\033[0m"
 echo ""
 
 read -rp "	Voulez-vous redémarrer l'ordinateur maintenant (y/N) ? " reboot_now
 if [[ "$reboot_now" =~ ^[yY]$ ]]; then
-    echo -e " \e[1;36m	Redémarrage du système... \e[0m"
-    # Le trap cleanup s'exécutera automatiquement juste avant le reboot
+    echo -e " \033[1;36m\tRedémarrage du système...\033[0m"
     sudo reboot
 else
-    echo -e " \e[1;32m	Pensez à redémarrer manuellement plus tard. À bientôt ! \e[0m"
+    echo -e " \033[1;32m\tPensez à redémarrer manuellement plus tard. À bientôt !\033[0m"
 fi
