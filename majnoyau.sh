@@ -351,19 +351,35 @@ done
 # 7. TÉLÉCHARGEMENT ET VÉRIFICATION CRYPTOGRAPHIQUE (GPG + SHA256)
 # ==============================================================================
 cd "$TEMP_DIR" || exit 1
+
+# Vérification de l'espace disque disponible (en Mo) avant téléchargement
+free_boot=$(df -m /boot | awk 'NR==2 {print $4}')
+free_tmp=$(df -m "$TEMP_DIR" | awk 'NR==2 {print $4}')
+
+if [ "$free_boot" -lt 150 ]; then
+    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans /boot (${free_boot} Mo libres, 150 Mo requis) ! \033[0m"
+    echo -e " \033[1;33mSupprimez d'anciens noyaux avant de continuer pour éviter de bloquer GRUB. \033[0m"
+    exit 1
+fi
+
+if [ "$free_tmp" -lt 300 ]; then
+    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans $TEMP_DIR (${free_tmp} Mo libres, 300 Mo requis) ! \033[0m"
+    exit 1
+fi
+
 echo ""
-echo -e " \e[1;32m	Téléchargement des paquets dans : $TEMP_DIR \e[0m"
+echo -e " \033[1;32m	Téléchargement des paquets dans : $TEMP_DIR \033[0m"
 echo ""
 
 for url in "${target_urls[@]}"; do
     wget -q --show-progress "$url" || {
-        echo -e " \e[1;31mErreur lors du téléchargement de $(basename "$url"). \e[0m"
+        echo -e " \033[1;31mErreur lors du téléchargement de $(basename "$url"). \033[0m"
         exit 1
     }
 done
 
 echo ""
-echo -e " \e[1;36m	Vérification de l'authenticité et de l'intégrité (GPG & SHA256)... \e[0m"
+echo -e " \033[1;36m	Vérification de l'authenticité et de l'intégrité (GPG & SHA256)... \033[0m"
 
 CHECKSUM_URL=""
 if echo "$root_links" | grep -q "CHECKSUMS$"; then
@@ -383,8 +399,8 @@ if [ -n "$CHECKSUM_URL" ]; then
         # 1. Importation du trousseau officiel d'Ubuntu
         [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ] && gpg --import /usr/share/keyrings/ubuntu-archive-keyring.gpg >/dev/null 2>&1
 
-        # 2. Téléchargement et importation de la clé Kernel PPA (URL assemblée)
-        KS_HOST="keyserver.ubuntu.com"
+        # 2. Téléchargement et importation de la clé Kernel PPA
+        KS_HOST="://ubuntu.com"
         UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
         curl -kfsSL "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null
         [ -s key.asc ] && gpg --import key.asc >/dev/null 2>&1
@@ -394,11 +410,11 @@ if [ -n "$CHECKSUM_URL" ]; then
         GPG_STATUS=$?
 
         if [ $GPG_STATUS -eq 0 ]; then
-            echo -e "	 \e[1;32m✔ Signature GPG valide (Kernel PPA <kernel-ppa@canonical.com>). \e[0m"
+            echo -e "	 \033[1;32m✔ Signature GPG valide (Kernel PPA <kernel-ppa@canonical.com>). \033[0m"
         elif echo "$GPG_OUTPUT" | grep -qiE "expired|expirée"; then
-            echo -e "	 \e[1;32m✔ Signature GPG authentique (clé d'archive expirée, normal pour ce noyau). \e[0m"
+            echo -e "	 \033[1;32m✔ Signature GPG authentique (clé d'archive expirée, normal pour ce noyau). \033[0m"
         else
-            echo -e "	 \e[1;33m⚠️  Échec GPG : $(echo "$GPG_OUTPUT" | tail -n 1)\e[0m"
+            echo -e "	 \033[1;33m⚠️  Échec GPG : $(echo "$GPG_OUTPUT" | tail -n 1)\033[0m"
             read -rp "	Continuer malgré tout avec la vérification SHA256 uniquement (y/N) ? " bypass_gpg
             [[ ! "$bypass_gpg" =~ ^[yY]$ ]] && exit 1
         fi
@@ -410,21 +426,21 @@ if [ -n "$CHECKSUM_URL" ]; then
             if [ -n "$expected_sha" ]; then
                 actual_sha=$(sha256sum "$deb" | awk '{print $1}')
                 if [ "$expected_sha" == "$actual_sha" ]; then
-                    echo -e "	 \e[1;32m✔ SHA256 OK : \e[0m $deb"
+                    echo -e "	 \033[1;32m✔ SHA256 OK : \033[0m $deb"
                 else
-                    echo -e "	 \e[1;31m✘ SHA256 INVALIDE : \e[0m $deb"
+                    echo -e "	 \033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
                     sha_failed=1
                 fi
             fi
         done
 
         if [ "$sha_failed" -eq 1 ]; then
-            echo -e " \e[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée. \e[0m"
+            echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée. \033[0m"
             exit 1
         fi
     fi
 else
-    echo -e "	 \e[1;33m⚠️  Fichiers CHECKSUMS absents pour cette version ancienne. \e[0m"
+    echo -e "	 \033[1;33m⚠️  Fichiers CHECKSUMS absents pour cette version ancienne. \033[0m"
 fi
 
 
