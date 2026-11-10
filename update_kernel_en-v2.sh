@@ -1,14 +1,14 @@
 #!/bin/bash
 # ==============================================================================
-# Automated Linux Kernel Updater (Ubuntu Mainline)
+# Automated Linux Kernel Update (Ubuntu Mainline)
 # Original Author : RISTOVSKI Nicolas (2016-11)
-# Update & Refactor : 2026-11 (HTTPS, Grid UI, GPG/SHA256 Verification)
+# Update & Refactor : 2026-11 (HTTPS, Grid, Anti-Cache, GPG/SHA256)
 # ==============================================================================
 
 clear
 
 # ==============================================================================
-# 1. TEMPORARY DIRECTORY MANAGEMENT AND AUTOMATIC CLEANUP
+# 1. TEMPORARY DIRECTORY MANAGEMENT & AUTOMATIC CLEANUP
 # ==============================================================================
 TEMP_DIR=$(mktemp -d /tmp/kernel_update_XXXXXX)
 
@@ -28,7 +28,7 @@ cleanup() {
 # Trigger cleanup() only upon actual script exit
 trap cleanup EXIT
 
-# Force immediate script termination on CTRL+C (which triggers EXIT)
+# Force immediate script termination on CTRL+C (which will trigger EXIT)
 trap 'echo ""; echo -e " \033[1;33mInterrupted by user (CTRL+C). Cleaning up...\033[0m"; exit 130' INT TERM
 
 # ==============================================================================
@@ -50,11 +50,12 @@ if [ "$network_ok" == "0" ]; then
 fi
 echo -e "\033[1;32mOK\033[0m"
 
-# Install required tools (lynx, wget, gnupg)
+# Install required tools (lynx, wget, gnupg, curl)
 MISSING_PKGS=()
 command -v lynx >/dev/null 2>&1 || MISSING_PKGS+=("lynx")
 command -v wget >/dev/null 2>&1 || MISSING_PKGS+=("wget")
-command -v gpg >/dev/null 2>&1 || MISSING_PKGS+=("gnupg")
+command -v gpg  >/dev/null 2>&1 || MISSING_PKGS+=("gnupg")
+command -v curl >/dev/null 2>&1 || MISSING_PKGS+=("curl")
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo "Installing missing dependencies: ${MISSING_PKGS[*]}..."
@@ -90,18 +91,23 @@ echo -e "\tDetected architecture: \033[1;33m$arch\033[0m"
 echo ""
 
 # ==============================================================================
-# 4. KERNEL VERSIONS RETRIEVAL AND GRID PAGINATION (HTTPS)
+# 4. REAL-TIME FETCHING AND GRID PAGINATION (HTTPS + ANTI-CACHE)
 # ==============================================================================
 BASE_URL="https://kernel.ubuntu.com/mainline/"
-echo "Fetching kernel version list from Ubuntu Mainline..."
+echo "Fetching and verifying kernel versions in real time from Ubuntu Mainline..."
+echo -e "\033[1;33mNote: RC (Release Candidate) kernels are intentionally excluded from the list.\033[0m"
+
+# Fetch HTML index without cache
+raw_html=$(curl -sL -H "Cache-Control: no-cache, no-store" -H "Pragma: no-cache" "${BASE_URL}?nocache=$(date +%s)" 2>/dev/null)
 
 mapfile -t all_versions < <(
-    lynx -dump -listonly -nonumbers "$BASE_URL" 2>/dev/null \
+    echo "$raw_html" \
+    | grep -oE 'href="v[0-9]+\.[0-9]+[^"]*/"' \
+    | sed -E 's/href="//; s/"$//' \
     | grep -v "rc" \
-    | grep -E '/v[0-9]+\.[0-9]+' \
     | sed 's|/$||' \
     | sort -uV \
-    | sed 's|$|/|'
+    | sed "s|^|${BASE_URL}|; s|$|/|"
 )
 
 total_versions=${#all_versions[@]}
@@ -109,6 +115,22 @@ if [ "$total_versions" -eq 0 ]; then
     echo -e "\033[1;31mError: Unable to retrieve kernel list from $BASE_URL.\033[0m"
     exit 1
 fi
+
+# Real-time check of the latest 5 folders (removes empty or failed build directories)
+check_count=5
+[ "$total_versions" -lt "$check_count" ] && check_count=$total_versions
+
+for ((i = total_versions - 1; i >= total_versions - check_count; i--)); do
+    test_url="${all_versions[$i]}"
+    page_content=$(curl -sL -H "Cache-Control: no-cache" "$test_url" "${test_url}${arch}/" 2>/dev/null)
+    if ! grep -qE "_(${arch}|all)\.deb" <<< "$page_content"; then
+        unset 'all_versions[i]'
+    fi
+done
+
+# Re-index array cleanly after removing empty folders
+all_versions=("${all_versions[@]}")
+total_versions=${#all_versions[@]}
 
 page_size=60
 page_step=1
@@ -132,7 +154,7 @@ tput civis 2>/dev/null
 load_kernel_page
 active_index=$(( num_options - 1 ))
 
-# Helper function to center text based on its visible character length
+# Helper function to center a line of text according to its actual visible length
 print_centered() {
     local text="$1"
     local plain_text
@@ -145,11 +167,11 @@ print_centered() {
 }
 
 print_header() {
-    print_centered "\033[1;36m[ Automated Linux Kernel Updater ]\033[0m"
+    print_centered "\033[1;36m[ Automated Linux Kernel Update ]\033[0m"
     print_centered "\033[0;37m... RISTOVSKI Nicolas (2016-11) ...\033[0m"
     print_centered "\033[0;37mupdate: (2026-11)\033[0m"
     echo ""
-    print_centered "\033[1;37mDetected architecture: \033[1;33m${arch}\033[0m"
+    print_centered "\033[1;37mDetected architecture: \033[1;33m${arch}\033[0m | \033[0;33m(Stable versions only - RC excluded)\033[0m"
     echo ""
 }
 
@@ -158,7 +180,7 @@ display_menu() {
     local term_cols
     term_cols=$(tput cols 2>/dev/null || echo 120)
     
-    # Grid is 5 columns x 21 characters = 105 characters wide
+    # Grid is 5 columns of 21 characters = 105 characters wide
     local grid_width=$(( cols * 21 ))
     local left_margin=$(( (term_cols - grid_width) / 2 ))
     [ $left_margin -lt 0 ] && left_margin=0
@@ -190,9 +212,9 @@ display_menu() {
     echo ""
     local real_page=$(( max_pages - page_step + 1 ))
     echo -ne "\033[K"
-    print_centered "\033[1;36m--- Page $real_page/$max_pages | [Arrows]: Navigate | [-]: Previous | [+]: Next | [Enter]: Select ---\033[0m"
+    print_centered "\033[1;36m--- Page $real_page/$max_pages | [Arrows]: Navigate | [-]: Previous | [+]: Next | [Enter]: Confirm ---\033[0m"
     
-    # Clear anything remaining below
+    # Clear only remaining lines below
     echo -ne "\033[J"
 }
 
@@ -243,11 +265,11 @@ site2="${site#v}"
 echo -e " \033[1m   Selected version for installation : \033[1;32m$site\033[0m ($kernelURL)"
 echo -e " \033[1;36m   Currently running kernel version  : $(uname -r)\033[0m"
 echo ""
-echo -e " \033[1;32m   Kernels currently installed in /boot:\033[0m"
+echo -e " \033[1;32m   Kernels currently installed in /boot :\033[0m"
 ls /boot 2>/dev/null | grep initrd | cut -d- -f2,3,4 | sed 's/^/\t/'
 echo ""
 
-prompt_msg=$(printf "\033[3m\tWould you like to install the 'lowlatency' variant (y/n)? \033[0m")
+prompt_msg=$(printf "\033[3m\tDo you want to install the 'lowlatency' variant (y/n)? \033[0m")
 echo -ne "$prompt_msg"
 
 while true; do
@@ -284,7 +306,7 @@ fi
 
 if [ "$choix" == "lowlatency" ] && ! printf "%s\n" "${liste_debs[@]}" | grep -q "lowlatency"; then
     echo -e "\t\033[1;31m⚠️  Note: No 'lowlatency' packages available for v.${site2}.\033[0m"
-    echo -e "\t\033[1;31m   Automatically falling back to 'generic' variant...\033[0m"
+    echo -e "\t\033[1;31m   Automatically switching to 'generic' variant...\033[0m"
     echo ""
     choix="generic"
     low=0
@@ -293,11 +315,11 @@ fi
 # Check if this exact version and variant are already installed
 if ls /boot/initrd.img-"${site2}"*-"${choix}" >/dev/null 2>&1; then
     echo ""
-    echo -e " \033[1;31m   [ABORTED] Linux Kernel $site ($choix) is already installed on your system!\033[0m"
+    echo -e " \033[1;31m   [ABORTED] Linux kernel $site ($choix) is already installed on your system!\033[0m"
     exit 0
 fi
 
-# Filter the latest revision and target packages
+# Filter latest revision and target packages
 latest_revision=$(printf "%s\n" "${liste_debs[@]}" | grep "$choix" | grep -oE "[0-9]{8,12}" | sort -V | tail -1)
 [ -z "$latest_revision" ] && latest_revision=$(printf "%s\n" "${liste_debs[@]}" | grep -oE "[0-9]{8,12}" | sort -V | tail -1)
 
@@ -329,7 +351,7 @@ echo -e "    \033[4;36m_________________________________________________________
 echo ""
 
 echo -e "\t\033[1;4;92m  Press [Enter] to start download and GPG verification!\033[0m"
-echo -e "\t\033[1;31m  Or [CTRL]-[C] to cancel and quit...\033[0m"
+echo -e "\t\033[1;31m  Or [CTRL]-[C] to cancel and exit...\033[0m"
 
 while true; do
     read -rsn1 key
@@ -346,13 +368,13 @@ free_boot=$(df -m /boot | awk 'NR==2 {print $4}')
 free_tmp=$(df -m "$TEMP_DIR" | awk 'NR==2 {print $4}')
 
 if [ "$free_boot" -lt 150 ]; then
-    echo -e " \033[1;31m[WARNING] Insufficient disk space in /boot (${free_boot} MB free, 150 MB required)!\033[0m"
-    echo -e " \033[1;33mPlease remove old kernels before continuing to avoid breaking GRUB.\033[0m"
+    echo -e " \033[1;31m[ALERT] Insufficient space in /boot (${free_boot} MB free, 150 MB required)!\033[0m"
+    echo -e " \033[1;33mRemove old kernels before continuing to avoid breaking GRUB.\033[0m"
     exit 1
 fi
 
 if [ "$free_tmp" -lt 300 ]; then
-    echo -e " \033[1;31m[WARNING] Insufficient disk space in $TEMP_DIR (${free_tmp} MB free, 300 MB required)!\033[0m"
+    echo -e " \033[1;31m[ALERT] Insufficient space in $TEMP_DIR (${free_tmp} MB free, 300 MB required)!\033[0m"
     exit 1
 fi
 
@@ -388,7 +410,7 @@ if [ -n "$CHECKSUM_URL" ]; then
         # 1. Import official Ubuntu archive keyring
         [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ] && gpg --import /usr/share/keyrings/ubuntu-archive-keyring.gpg >/dev/null 2>&1
 
-        # 2. Download and import Kernel PPA signing key
+        # 2. Download and import Kernel PPA public key
         KS_HOST="keyserver.ubuntu.com"
         UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
         curl -kfsSL "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null
@@ -401,10 +423,10 @@ if [ -n "$CHECKSUM_URL" ]; then
         if [ $GPG_STATUS -eq 0 ]; then
             echo -e "\t\033[1;32m✔ Valid GPG signature (Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
         elif echo "$GPG_OUTPUT" | grep -qiE "expired|expirée"; then
-            echo -e "\t\033[1;32m✔ Authentic GPG signature (archive key expired, normal for this older kernel).\033[0m"
+            echo -e "\t\033[1;32m✔ Authentic GPG signature (archive key expired, expected for older kernels).\033[0m"
         else
             echo -e "\t\033[1;33m⚠️  GPG verification failed: $(echo "$GPG_OUTPUT" | tail -n 1)\033[0m"
-            read -rp "	Continue anyway with SHA256 verification only (y/N)? " bypass_gpg
+            read -rp "\tContinue anyway with SHA256 verification only (y/N)? " bypass_gpg
             [[ ! "$bypass_gpg" =~ ^[yY]$ ]] && exit 1
         fi
 
@@ -461,10 +483,10 @@ echo -e " \033[1;32m✔ Kernel $site ($choix) installation completed successfull
 echo -e " \033[1;33m\tA system reboot is required to load the new kernel.\033[0m"
 echo ""
 
-read -rp "	Would you like to reboot the computer now (y/N)? " reboot_now
+read -rp "\tDo you want to reboot the computer now (y/N)? " reboot_now
 if [[ "$reboot_now" =~ ^[yY]$ ]]; then
     echo -e " \033[1;36m\tRebooting system...\033[0m"
     sudo reboot
 else
-    echo -e " \033[1;32m\tPlease remember to reboot manually later. Goodbye!\033[0m"
+    echo -e " \033[1;32m\tRemember to reboot manually later. Goodbye!\033[0m"
 fi
