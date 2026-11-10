@@ -2,7 +2,7 @@
 # ==============================================================================
 # Mise à jour automatisée du Noyau Linux (Ubuntu Mainline)
 # Auteur original : RISTOVSKI Nicolas (2016-11)
-# Mise à jour & Refonte : 2026-11 (HTTPS, Grille, GPG/SHA256)
+# Mise à jour & Refonte : 2026-11 (HTTPS, Grille, Anti-Cache, GPG/SHA256)
 # ==============================================================================
 
 clear
@@ -36,7 +36,7 @@ trap 'echo ""; echo -e " \033[1;33mInterruption par l'\''utilisateur (CTRL+C). N
 # ==============================================================================
 echo -n "Vérification de la connexion internet... "
 if command -v curl >/dev/null 2>&1; then
-    network_ok=$(curl -sI --connect-timeout 5 https://kernel.ubuntu.com/mainline/ >/dev/null && echo "1" || echo "0")
+    network_ok=$(curl -sI --connect-timeout 5 https://kernel.ubuntu.com/mainline/ >/dev/null 2>&1 && echo "1" || echo "0")
 else
     gw=$(ip r | awk '/default/ {print $3; exit}')
     network_ok=$([ -n "$gw" ] && ping -q -w 2 -c 1 "$gw" >/dev/null 2>&1 && echo "1" || echo "0")
@@ -50,11 +50,12 @@ if [ "$network_ok" == "0" ]; then
 fi
 echo -e "\033[1;32mOK\033[0m"
 
-# Installation des outils requis (lynx, wget, gnupg)
+# Installation des outils requis (lynx, wget, gnupg, curl)
 MISSING_PKGS=()
 command -v lynx >/dev/null 2>&1 || MISSING_PKGS+=("lynx")
 command -v wget >/dev/null 2>&1 || MISSING_PKGS+=("wget")
-command -v gpg >/dev/null 2>&1 || MISSING_PKGS+=("gnupg")
+command -v gpg  >/dev/null 2>&1 || MISSING_PKGS+=("gnupg")
+command -v curl >/dev/null 2>&1 || MISSING_PKGS+=("curl")
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo "Installation des dépendances manquantes : ${MISSING_PKGS[*]}..."
@@ -90,18 +91,22 @@ echo -e "\tArchitecture détectée : \033[1;33m$arch\033[0m"
 echo ""
 
 # ==============================================================================
-# 4. RÉCUPÉRATION ET PAGINATION EN GRILLE DES VERSIONS (HTTPS)
+# 4. RÉCUPÉRATION EN TEMPS RÉEL ET PAGINATION EN GRILLE (HTTPS + ANTI-CACHE)
 # ==============================================================================
 BASE_URL="https://kernel.ubuntu.com/mainline/"
-echo "Récupération de la liste des versions depuis Ubuntu Mainline..."
+echo "Récupération et vérification en temps réel des versions depuis Ubuntu Mainline..."
+echo -e "\033[0;33mNote : Les versions de test (Release Candidates / RC) sont exclues de la liste.\033[0m"
+
+raw_html=$(curl -sL -H "Cache-Control: no-cache, no-store" -H "Pragma: no-cache" "${BASE_URL}?nocache=$(date +%s)" 2>/dev/null)
 
 mapfile -t all_versions < <(
-    lynx -dump -listonly -nonumbers "$BASE_URL" 2>/dev/null \
+    echo "$raw_html" \
+    | grep -oE 'href="v[0-9]+\.[0-9]+[^"]*/"' \
+    | sed -E 's/href="//; s/"$//' \
     | grep -v "rc" \
-    | grep -E '/v[0-9]+\.[0-9]+' \
     | sed 's|/$||' \
     | sort -uV \
-    | sed 's|$|/|'
+    | sed "s|^|${BASE_URL}|; s|$|/|"
 )
 
 total_versions=${#all_versions[@]}
@@ -109,6 +114,23 @@ if [ "$total_versions" -eq 0 ]; then
     echo -e "\033[1;31mErreur : Impossible de récupérer la liste des noyaux depuis $BASE_URL.\033[0m"
     exit 1
 fi
+
+# Vérification en temps réel des 5 derniers dossiers (élimine les dossiers vides ou en échec)
+check_count=5
+[ "$total_versions" -lt "$check_count" ] && check_count=$total_versions
+
+for ((i = total_versions - 1; i >= total_versions - check_count; i--)); do
+    test_url="${all_versions[$i]}"
+    page_root=$(curl -sL -H "Cache-Control: no-cache" "$test_url" 2>/dev/null)
+    page_arch=$(curl -sL -H "Cache-Control: no-cache" "${test_url}${arch}/" 2>/dev/null)
+    if ! printf "%s\n%s\n" "$page_root" "$page_arch" | grep -qE "_(${arch}|all)\.deb"; then
+        unset 'all_versions[i]'
+    fi
+done
+
+# Réindexation propre du tableau après suppression des dossiers vides
+all_versions=("${all_versions[@]}")
+total_versions=${#all_versions[@]}
 
 page_size=60
 page_step=1
@@ -149,7 +171,7 @@ print_header() {
     print_centered "\033[0;37m... RISTOVSKI Nicolas (2016-11) ...\033[0m"
     print_centered "\033[0;37mupdate: (2026-11)\033[0m"
     echo ""
-    print_centered "\033[1;37mArchitecture détectée : \033[1;33m${arch}\033[0m"
+    print_centered "\033[1;37mArchitecture détectée : \033[1;33m${arch}\033[0m   |   \033[0;37m(Noyaux RC non listés)\033[0m"
     echo ""
 }
 
