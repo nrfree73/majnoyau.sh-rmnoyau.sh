@@ -16,7 +16,11 @@ TEMP_DIR=$(mktemp -d /tmp/kernel_update_XXXXXX) || {
     exit 1
 }
 
+CLEANUP_DONE=0
 cleanup() {
+    [ "$CLEANUP_DONE" -eq 1 ] && return
+    CLEANUP_DONE=1
+
     tput cnorm 2>/dev/null || true
     stty sane 2>/dev/null || true
 
@@ -31,6 +35,7 @@ cleanup() {
 on_interrupt() {
     echo ""
     echo -e " \033[1;33mInterruption par l'utilisateur (CTRL+C). Nettoyage...\033[0m"
+    cleanup
     exit 130
 }
 
@@ -133,8 +138,10 @@ if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo "Installation des dépendances manquantes : ${MISSING_PKGS[*]}..."
     sudo apt-get update -qq && sudo apt-get install -y "${MISSING_PKGS[@]}"
     for pkg in "${MISSING_PKGS[@]}"; do
-        if ! command -v "$pkg" >/dev/null 2>&1 && [ "$pkg" != "gnupg" ]; then
-            echo "Échec de l'installation du paquet '$pkg' ! [Entrée] pour quitter..."
+        bin_name="$pkg"
+        [ "$pkg" == "gnupg" ] && bin_name="gpg"
+        if ! command -v "$bin_name" >/dev/null 2>&1; then
+            echo "Échec de l'installation du paquet '$pkg' (commande '$bin_name' introuvable) ! [Entrée] pour quitter..."
             read -r
             exit 1
         fi
@@ -187,7 +194,7 @@ if [ "$total_versions" -eq 0 ]; then
     exit 1
 fi
 
-check_count=5
+check_count=8
 [ "$total_versions" -lt "$check_count" ] && check_count=$total_versions
 
 for ((i = total_versions - 1; i >= total_versions - check_count; i--)); do
@@ -400,9 +407,17 @@ if ls /boot/initrd.img-"${site2}"*-"${choix}" >/dev/null 2>&1; then
     exit 0
 fi
 
-# Gestion sûre des révisions multiples (les headers_all.deb peuvent garder l'horodatage initial)
-latest_arch_rev=$(printf "%s\n" "${liste_debs[@]}" | grep -E "_${arch}\.deb$" | grep "$choix" | grep -oE "[0-9]{8,12}" | sort -V | tail -1 || true)
-latest_all_rev=$(printf "%s\n" "${liste_debs[@]}" | grep -E "_all\.deb$" | grep -oE "[0-9]{8,12}" | sort -V | tail -1 || true)
+# Gestion sûre des révisions multiples (extraction de l'horodatage uniquement sur le nom de fichier)
+latest_arch_rev=$(
+    for u in "${liste_debs[@]}"; do basename "$u"; done \
+    | grep -E "_${arch}\.deb$" | grep "$choix" \
+    | grep -oE "\.[0-9]{8,12}_" | tr -d '._' | sort -V | tail -1 || true
+)
+latest_all_rev=$(
+    for u in "${liste_debs[@]}"; do basename "$u"; done \
+    | grep -E "_all\.deb$" \
+    | grep -oE "\.[0-9]{8,12}_" | tr -d '._' | sort -V | tail -1 || true
+)
 
 mapfile -t target_urls < <(
     {
@@ -480,117 +495,133 @@ curl -fsSL --connect-timeout 5 --max-time 10 "${pkg_base_url}CHECKSUMS.gpg" -o C
 curl -fsSL --connect-timeout 5 --max-time 10 "${kernelURL}CHECKSUMS" -o CHECKSUMS_ROOT 2>/dev/null || rm -f CHECKSUMS_ROOT
 curl -fsSL --connect-timeout 5 --max-time 10 "${kernelURL}CHECKSUMS.gpg" -o CHECKSUMS_ROOT.gpg 2>/dev/null || rm -f CHECKSUMS_ROOT.gpg
 
-# Détection intelligente : signature détachée (.gpg) OU signature interne (clearsigned)
-SIG_FILE=""
-DATA_FILE=""
-IS_CLEARSIGNED=0
+# Préparation de l'environnement GPG isolé
+export GNUPGHOME="$TEMP_DIR/.gnupg"
+mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
 
-if [ -s CHECKSUMS_ARCH ] && [ -s CHECKSUMS_ARCH.gpg ]; then
-    DATA_FILE="CHECKSUMS_ARCH"
-    SIG_FILE="CHECKSUMS_ARCH.gpg"
-elif [ -s CHECKSUMS_ROOT ] && [ -s CHECKSUMS_ROOT.gpg ]; then
-    DATA_FILE="CHECKSUMS_ROOT"
-    SIG_FILE="CHECKSUMS_ROOT.gpg"
-elif [ -s CHECKSUMS_ARCH ] && grep -q "^-----BEGIN PGP SIGNED MESSAGE-----" CHECKSUMS_ARCH; then
-    DATA_FILE="CHECKSUMS_ARCH"
-    IS_CLEARSIGNED=1
-elif [ -s CHECKSUMS_ROOT ] && grep -q "^-----BEGIN PGP SIGNED MESSAGE-----" CHECKSUMS_ROOT; then
-    DATA_FILE="CHECKSUMS_ROOT"
-    IS_CLEARSIGNED=1
+[ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ] && gpg --import /usr/share/keyrings/ubuntu-archive-keyring.gpg >/dev/null 2>&1 || true
+
+KS_HOST="keyserver.ubuntu.com"
+UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
+if curl -fsSL --connect-timeout 5 --max-time 10 "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null && [ -s key.asc ]; then
+    if gpg --with-colons --import-options show-only --import key.asc 2>/dev/null | grep -q "fpr:::::::::${UBUNTU_KERNEL_KEY}:"; then
+        gpg --import key.asc >/dev/null 2>&1 || true
+    else
+        echo -e "\t\033[1;31m[ALERTE SÉCURITÉ] Empreinte de la clé GPG téléchargée non conforme !\033[0m"
+        exit 1
+    fi
 fi
 
-gpg_valid=0
-if [ -n "$DATA_FILE" ]; then
-    export GNUPGHOME="$TEMP_DIR/.gnupg"
-    mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+verify_checksum_target() {
+    local label="$1"
+    local data_f="$2"
+    local sig_f="$3"
+    local out_f="$4"
+    local gpg_out=""
 
-    [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ] && gpg --import /usr/share/keyrings/ubuntu-archive-keyring.gpg >/dev/null 2>&1 || true
-
-    KS_HOST="keyserver.ubuntu.com"
-    UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
-    if curl -fsSL --connect-timeout 5 --max-time 10 "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null && [ -s key.asc ]; then
-        if gpg --with-colons --import-options show-only --import key.asc 2>/dev/null | grep -q "fpr:::::::::${UBUNTU_KERNEL_KEY}:"; then
-            gpg --import key.asc >/dev/null 2>&1 || true
+    if [ -s "$data_f" ] && [ -s "$sig_f" ]; then
+        gpg_out=$(LC_ALL=C gpg --status-fd 2 --verify "$sig_f" "$data_f" 2>&1 >/dev/null || true)
+        if echo "$gpg_out" | grep -q "^\[GNUPG:\] VALIDSIG"; then
+            echo -e "\t\033[1;32m✔ Signature GPG valide ($label - Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
+            cat "$data_f" >> "$out_f"
+            return 0
+        elif echo "$gpg_out" | grep -q "^\[GNUPG:\] EXPKEYSIG"; then
+            echo -e "\t\033[1;32m✔ Signature GPG authentique ($label - clé d'archive expirée, normal pour ce noyau).\033[0m"
+            cat "$data_f" >> "$out_f"
+            return 0
         else
-            echo -e "\t\033[1;31m[ALERTE SÉCURITÉ] Empreinte de la clé GPG téléchargée non conforme !\033[0m"
+            echo -e "\t\033[1;33m⚠️  Échec de vérification GPG ($label) : $(echo "$gpg_out" | grep -v "^\[GNUPG:\]" | tail -n 1)\033[0m"
+            if ask_yn "\tIgnorer l'échec GPG pour $label et continuer (y/n) ? "; then
+                cat "$data_f" >> "$out_f"
+                return 0
+            else
+                exit 1
+            fi
         fi
+    elif [ -s "$data_f" ] && grep -q "^-----BEGIN PGP SIGNED MESSAGE-----" "$data_f"; then
+        gpg_out=$(LC_ALL=C gpg --status-fd 2 --decrypt "$data_f" > "${data_f}_EXTRACTED" 2>&1 || true)
+        if [ -s "${data_f}_EXTRACTED" ] && echo "$gpg_out" | grep -q "^\[GNUPG:\] VALIDSIG"; then
+            echo -e "\t\033[1;32m✔ Signature GPG valide ($label - Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
+            cat "${data_f}_EXTRACTED" >> "$out_f"
+            return 0
+        elif [ -s "${data_f}_EXTRACTED" ] && echo "$gpg_out" | grep -q "^\[GNUPG:\] EXPKEYSIG"; then
+            echo -e "\t\033[1;32m✔ Signature GPG authentique ($label - clé d'archive expirée, normal pour ce noyau).\033[0m"
+            cat "${data_f}_EXTRACTED" >> "$out_f"
+            return 0
+        else
+            echo -e "\t\033[1;33m⚠️  Échec de vérification GPG ($label) : $(echo "$gpg_out" | grep -v "^\[GNUPG:\]" | tail -n 1)\033[0m"
+            if ask_yn "\tIgnorer l'échec GPG pour $label et continuer (y/n) ? "; then
+                [ -s "${data_f}_EXTRACTED" ] && cat "${data_f}_EXTRACTED" >> "$out_f"
+                return 0
+            else
+                exit 1
+            fi
+        fi
+    elif [ -s "$data_f" ]; then
+        echo -e "\t\033[1;33m⚠️  Fichier $label trouvé sans signature GPG associée.\033[0m"
+        cat "$data_f" >> "$out_f"
+        return 0
+    fi
+    return 1
+}
+
+VERIFIED_MERGED="CHECKSUMS_MERGED"
+: > "$VERIFIED_MERGED"
+
+verify_checksum_target "arch" "CHECKSUMS_ARCH" "CHECKSUMS_ARCH.gpg" "$VERIFIED_MERGED" || true
+if [ "${pkg_base_url}" != "${kernelURL}" ]; then
+    verify_checksum_target "root" "CHECKSUMS_ROOT" "CHECKSUMS_ROOT.gpg" "$VERIFIED_MERGED" || true
+fi
+
+if [ -s "$VERIFIED_MERGED" ]; then
+    tr -d '\r' < "$VERIFIED_MERGED" | awk '
+        length($1) == 64 && $1 ~ /^[a-fA-F0-9]+$/ {
+            file = $NF
+            sub(/^.*\//, "", file)
+            sub(/^\*/, "", file)
+            print tolower($1) "  " file
+        }
+    ' | sort -u > CHECKSUMS_CLEAN
+
+    sha_failed=0
+    missing_hashes=()
+    for deb in *.deb; do
+        matched_line=$(awk -v f="$deb" '$2 == f { print $0; exit }' CHECKSUMS_CLEAN)
+        if [ -n "$matched_line" ]; then
+            if printf "%s\n" "$matched_line" | sha256sum --status -c - 2>/dev/null; then
+                echo -e "\t\033[1;32m✔ SHA256 OK : \033[0m $deb"
+            else
+                echo -e "\t\033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
+                sha_failed=1
+            fi
+        else
+            missing_hashes+=("$deb")
+        fi
+    done
+
+    if [ "$sha_failed" -eq 1 ]; then
+        echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s) détecté(s). Installation annulée.\033[0m"
+        exit 1
     fi
 
-    if [ "$IS_CLEARSIGNED" -eq 1 ]; then
-        GPG_STATUS_OUT=$(LC_ALL=C gpg --status-fd 1 --output CHECKSUMS_EXTRACTED --decrypt "$DATA_FILE" 2>&1 || true)
-        [ -s CHECKSUMS_EXTRACTED ] && DATA_FILE="CHECKSUMS_EXTRACTED"
-    else
-        GPG_STATUS_OUT=$(LC_ALL=C gpg --status-fd 1 --verify "$SIG_FILE" "$DATA_FILE" 2>&1 || true)
-    fi
-
-    if echo "$GPG_STATUS_OUT" | grep -q "^\[GNUPG:\] GOODSIG"; then
-        echo -e "\t\033[1;32m✔ Signature GPG valide (Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
-        gpg_valid=1
-    elif echo "$GPG_STATUS_OUT" | grep -q "^\[GNUPG:\] EXPKEYSIG"; then
-        echo -e "\t\033[1;32m✔ Signature GPG authentique (clé d'archive expirée, normal pour ce noyau).\033[0m"
-        gpg_valid=1
-    else
-        echo -e "\t\033[1;33m⚠️  Échec de vérification GPG : $(echo "$GPG_STATUS_OUT" | grep -v "^\[GNUPG:\]" | tail -n 1)\033[0m"
-        if ! ask_yn "\tContinuer malgré tout (y/n) ? "; then
+    if [ ${#missing_hashes[@]} -gt 0 ]; then
+        echo -e "\t\033[1;33m⚠️  [EMPREINTES .DEB NON PUBLIÉES SUR LE SERVEUR]\033[0m"
+        echo -e "\t\033[0;33m   Canonical n'a signé que les métadonnées de build dans CHECKSUMS (aucun SHA256 publié pour les .deb) :\033[0m"
+        for mh in "${missing_hashes[@]}"; do
+            echo -e "\t\033[0;33m     - $mh\033[0m"
+        done
+        if ! ask_yn "\tPoursuivre l'installation via HTTPS vérifié (y/n) ? "; then
             exit 1
         fi
+        echo ""
     fi
-
-    # Sécurité stricte : utiliser uniquement le fichier DATA_FILE authentifié par GPG
-    tr -d '\r' < "$DATA_FILE" | awk '
-        length($1) == 64 && $1 ~ /^[a-fA-F0-9]+$/ {
-            file = $NF
-            sub(/^.*\//, "", file)
-            sub(/^\*/, "", file)
-            print tolower($1) "  " file
-        }
-    ' > CHECKSUMS_CLEAN
-
-    sha_failed=0
-    for deb in *.deb; do
-        matched_line=$(awk -v f="$deb" '$2 == f { print $0; exit }' CHECKSUMS_CLEAN)
-        if [ -n "$matched_line" ]; then
-            if printf "%s\n" "$matched_line" | sha256sum --status -c - 2>/dev/null; then
-                echo -e "\t\033[1;32m✔ SHA256 OK : \033[0m $deb"
-            else
-                echo -e "\t\033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
-                sha_failed=1
-            fi
-        fi
-    done
-
-    if [ "$sha_failed" -eq 1 ]; then
-        echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée.\033[0m"
+else
+    echo -e "\t\033[1;33m⚠️  [AUCUN FICHIER CHECKSUMS TROUVÉ SUR LE SERVEUR]\033[0m"
+    echo -e "\t\033[0;33m   L'intégrité cryptographique SHA256/GPG ne peut pas être vérifiée pour cette version.\033[0m"
+    if ! ask_yn "\tPoursuivre l'installation malgré l'absence de CHECKSUMS (y/n) ? "; then
         exit 1
     fi
-elif [ -s CHECKSUMS_ARCH ] || [ -s CHECKSUMS_ROOT ]; then
-    # Cas où CHECKSUMS existe sans signature GPG associée : vérification silencieuse si absent, affichage si présent et valide
-    cat CHECKSUMS_ARCH CHECKSUMS_ROOT 2>/dev/null | tr -d '\r' | awk '
-        length($1) == 64 && $1 ~ /^[a-fA-F0-9]+$/ {
-            file = $NF
-            sub(/^.*\//, "", file)
-            sub(/^\*/, "", file)
-            print tolower($1) "  " file
-        }
-    ' > CHECKSUMS_CLEAN
-
-    sha_failed=0
-    for deb in *.deb; do
-        matched_line=$(awk -v f="$deb" '$2 == f { print $0; exit }' CHECKSUMS_CLEAN)
-        if [ -n "$matched_line" ]; then
-            if printf "%s\n" "$matched_line" | sha256sum --status -c - 2>/dev/null; then
-                echo -e "\t\033[1;32m✔ SHA256 OK : \033[0m $deb"
-            else
-                echo -e "\t\033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
-                sha_failed=1
-            fi
-        fi
-    done
-
-    if [ "$sha_failed" -eq 1 ]; then
-        echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée.\033[0m"
-        exit 1
-    fi
+    echo ""
 fi
 
 # ==============================================================================
