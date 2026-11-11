@@ -2,41 +2,87 @@
 # ==============================================================================
 # Mise à jour automatisée du Noyau Linux (Ubuntu Mainline)
 # Auteur original : RISTOVSKI Nicolas (2016-11)
-# Mise à jour & Refonte : 2026-11 (HTTPS, Grille, Anti-Cache, GPG/SHA256)
+# Mise à jour & Refonte : 2026-11 (HTTPS, Grille, Anti-Cache, GPG/SHA256, DKMS/UEFI)
 # ==============================================================================
 
+set -o pipefail
 clear
 
 # ==============================================================================
-# 1. GESTION DU DOSSIER TEMPORAIRE ET NETTOYAGE AUTOMATIQUE
+# 1. GESTION DU DOSSIER TEMPORAIRE, NETTOYAGE ET SAISIE STRICTE Y/N
 # ==============================================================================
-TEMP_DIR=$(mktemp -d /tmp/kernel_update_XXXXXX)
+TEMP_DIR=$(mktemp -d /tmp/kernel_update_XXXXXX) || {
+    echo "Erreur critique : Impossible de créer le dossier temporaire."
+    exit 1
+}
 
 cleanup() {
-    # Restaure l'affichage du curseur et l'état normal du terminal
-    tput cnorm 2>/dev/null
-    stty sane 2>/dev/null
+    tput cnorm 2>/dev/null || true
+    stty sane 2>/dev/null || true
 
     if [ -d "$TEMP_DIR/.gnupg" ]; then
-        GNUPGHOME="$TEMP_DIR/.gnupg" gpgconf --kill all >/dev/null 2>&1
+        GNUPGHOME="$TEMP_DIR/.gnupg" gpgconf --kill all >/dev/null 2>&1 || true
     fi
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR"
     fi
 }
 
-# Déclenche cleanup() uniquement à la sortie réelle du script
+on_interrupt() {
+    echo ""
+    echo -e " \033[1;33mInterruption par l'utilisateur (CTRL+C). Nettoyage...\033[0m"
+    exit 130
+}
+
 trap cleanup EXIT
+trap on_interrupt INT TERM
 
-# Force l'arrêt immédiat du script lors d'un CTRL+C (ce qui déclenchera EXIT)
-trap 'echo ""; echo -e " \033[1;33mInterruption par l'\''utilisateur (CTRL+C). Nettoyage...\033[0m"; exit 130' INT TERM
+# Fonction de confirmation stricte : n'accepte uniquement que les touches y/Y ou n/N
+ask_yn() {
+    local prompt="$1"
+    local ans
+    echo -ne "$prompt"
+    while true; do
+        read -rsn1 ans
+        case "$ans" in
+            [yY]) echo "y"; return 0 ;;
+            [nN]) echo "n"; return 1 ;;
+        esac
+    done
+}
 
 # ==============================================================================
-# 2. VÉRIFICATION DU RÉSEAU ET DES DÉPENDANCES
+# 2. VÉRIFICATION DE L'ESPACE DISQUE, DU RÉSEAU, SECURE BOOT, DKMS ET DÉPENDANCES
 # ==============================================================================
+free_boot=$(df -Pm /boot | awk 'NR==2 {print $4}')
+free_tmp=$(df -Pm "$TEMP_DIR" | awk 'NR==2 {print $4}')
+
+if [ "$free_boot" -lt 250 ]; then
+    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans /boot (${free_boot} Mo libres, 250 Mo requis) !\033[0m"
+    echo -e " \033[1;33mSupprimez d'anciens noyaux pour éviter de bloquer GRUB lors de l'installation.\033[0m"
+    if ask_yn " Voulez-vous exécuter 'sudo apt-get autoremove --purge' maintenant (y/n) ? "; then
+        echo ""
+        sudo apt-get autoremove --purge -y
+        free_boot=$(df -Pm /boot | awk 'NR==2 {print $4}')
+        if [ "$free_boot" -lt 250 ]; then
+            echo -e " \033[1;31mEspace toujours insuffisant dans /boot (${free_boot} Mo libres). Abandon.\033[0m"
+            exit 1
+        fi
+        echo -e " \033[1;32mEspace libéré dans /boot : ${free_boot} Mo disponibles.\033[0m"
+        echo ""
+    else
+        exit 1
+    fi
+fi
+
+if [ "$free_tmp" -lt 350 ]; then
+    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans $TEMP_DIR (${free_tmp} Mo libres, 350 Mo requis) !\033[0m"
+    exit 1
+fi
+
 echo -n "Vérification de la connexion internet... "
 if command -v curl >/dev/null 2>&1; then
-    network_ok=$(curl -sI --connect-timeout 5 https://kernel.ubuntu.com/mainline/ >/dev/null 2>&1 && echo "1" || echo "0")
+    network_ok=$(curl -sI --connect-timeout 5 --max-time 8 https://kernel.ubuntu.com/mainline/ >/dev/null 2>&1 && echo "1" || echo "0")
 else
     gw=$(ip r | awk '/default/ {print $3; exit}')
     network_ok=$([ -n "$gw" ] && ping -q -w 2 -c 1 "$gw" >/dev/null 2>&1 && echo "1" || echo "0")
@@ -49,10 +95,36 @@ if [ "$network_ok" == "0" ]; then
     exit 1
 fi
 echo -e "\033[1;32mOK\033[0m"
+echo ""
 
-# Installation des outils requis (lynx, wget, gnupg, curl)
+# Vérification du Secure Boot UEFI
+if command -v mokutil >/dev/null 2>&1; then
+    if mokutil --sb-state 2>/dev/null | grep -qi "SecureBoot enabled"; then
+        echo -e "\033[1;33m⚠️  [AVERTISSEMENT SECURE BOOT UEFI ACTIVÉ]\033[0m"
+        echo -e "\033[0;33m   Les noyaux Ubuntu Mainline ne sont pas signés pour le Secure Boot.\033[0m"
+        echo -e "\033[0;33m   Le système refusera de démarrer sur ce noyau tant que Secure Boot est actif.\033[0m"
+        if ! ask_yn "   Continuer malgré tout (y/n) ? "; then
+            exit 0
+        fi
+        echo ""
+    fi
+fi
+
+# Vérification des modules DKMS actifs
+if command -v dkms >/dev/null 2>&1; then
+    dkms_list=$(dkms status 2>/dev/null || true)
+    if [ -n "$dkms_list" ]; then
+        echo -e "\033[1;33m⚠️  [AVERTISSEMENT MODULES DKMS DÉTECTÉS]\033[0m"
+        echo -e "\033[0;33m   Des pilotes externes compilés via DKMS sont présents sur votre système :\033[0m"
+        echo "$dkms_list" | sed 's/^/     - /'
+        echo -e "\033[0;33m   Un noyau trop récent peut provoquer un échec de compilation de ces pilotes.\033[0m"
+        read -rp "   Appuyez sur [Entrée] pour continuer ou [CTRL]-[C] pour annuler... "
+        echo ""
+    fi
+fi
+
+# Installation des outils requis (wget, gnupg, curl)
 MISSING_PKGS=()
-command -v lynx >/dev/null 2>&1 || MISSING_PKGS+=("lynx")
 command -v wget >/dev/null 2>&1 || MISSING_PKGS+=("wget")
 command -v gpg  >/dev/null 2>&1 || MISSING_PKGS+=("gnupg")
 command -v curl >/dev/null 2>&1 || MISSING_PKGS+=("curl")
@@ -97,16 +169,16 @@ BASE_URL="https://kernel.ubuntu.com/mainline/"
 echo "Récupération et vérification en temps réel des versions depuis Ubuntu Mainline..."
 echo -e "\033[0;33mNote : Les versions de test (Release Candidates / RC) sont exclues de la liste.\033[0m"
 
-raw_html=$(curl -sL -H "Cache-Control: no-cache, no-store" -H "Pragma: no-cache" "${BASE_URL}?nocache=$(date +%s)" 2>/dev/null)
+raw_html=$(curl -sL --connect-timeout 5 --max-time 15 -H "Cache-Control: no-cache, no-store" -H "Pragma: no-cache" "${BASE_URL}?nocache=$(date +%s)" 2>/dev/null || true)
 
 mapfile -t all_versions < <(
     echo "$raw_html" \
     | grep -oE 'href="v[0-9]+\.[0-9]+[^"]*/"' \
     | sed -E 's/href="//; s/"$//' \
-    | grep -v "rc" \
+    | grep -viE -- '-rc[0-9]*' \
     | sed 's|/$||' \
     | sort -uV \
-    | sed "s|^|${BASE_URL}|; s|$|/|"
+    | sed "s|^|${BASE_URL}|; s|$|/|" || true
 )
 
 total_versions=${#all_versions[@]}
@@ -115,22 +187,25 @@ if [ "$total_versions" -eq 0 ]; then
     exit 1
 fi
 
-# Vérification en temps réel des 5 derniers dossiers (élimine les dossiers vides ou en échec)
 check_count=5
 [ "$total_versions" -lt "$check_count" ] && check_count=$total_versions
 
 for ((i = total_versions - 1; i >= total_versions - check_count; i--)); do
     test_url="${all_versions[$i]}"
-    page_root=$(curl -sL -H "Cache-Control: no-cache" "$test_url" 2>/dev/null)
-    page_arch=$(curl -sL -H "Cache-Control: no-cache" "${test_url}${arch}/" 2>/dev/null)
-    if ! printf "%s\n%s\n" "$page_root" "$page_arch" | grep -qE "_(${arch}|all)\.deb"; then
+    page_root=$(curl -sL --connect-timeout 3 --max-time 5 -H "Cache-Control: no-cache" "$test_url" 2>/dev/null || true)
+    page_arch=$(curl -sL --connect-timeout 3 --max-time 5 -H "Cache-Control: no-cache" "${test_url}${arch}/" 2>/dev/null || true)
+    if ! printf "%s\n%s\n" "$page_root" "$page_arch" | grep -qE "_${arch}\.deb"; then
         unset 'all_versions[i]'
     fi
 done
 
-# Réindexation propre du tableau après suppression des dossiers vides
 all_versions=("${all_versions[@]}")
 total_versions=${#all_versions[@]}
+
+if [ "$total_versions" -eq 0 ]; then
+    echo -e "\033[1;31mErreur : Aucun noyau valide trouvé pour l'architecture '$arch'.\033[0m"
+    exit 1
+fi
 
 page_size=60
 page_step=1
@@ -150,11 +225,10 @@ load_kernel_page() {
 }
 
 clear
-tput civis 2>/dev/null
+tput civis 2>/dev/null || true
 load_kernel_page
 active_index=$(( num_options - 1 ))
 
-# Fonction utilitaire pour centrer une ligne de texte selon sa longueur réelle
 print_centered() {
     local text="$1"
     local plain_text
@@ -179,18 +253,13 @@ display_menu() {
     local r c idx
     local term_cols
     term_cols=$(tput cols 2>/dev/null || echo 120)
-    
-    # La grille fait 5 colonnes de 21 caractères = 105 caractères de large
     local grid_width=$(( cols * 21 ))
     local left_margin=$(( (term_cols - grid_width) / 2 ))
     [ $left_margin -lt 0 ] && left_margin=0
 
-    # Replace le curseur tout en haut à gauche sans clignotement
     tput cup 0 0
-    
-    # Affiche l'en-tête centré et en couleur
     print_header
-    
+
     for ((r=0; r<rows; r++)); do
         echo -ne "\033[K"
         printf "%*s" "$left_margin" ""
@@ -213,8 +282,6 @@ display_menu() {
     local real_page=$(( max_pages - page_step + 1 ))
     echo -ne "\033[K"
     print_centered "\033[1;36m--- Page $real_page/$max_pages | [Flèches]: Naviguer | [-]: Précédent | [+]: Suivant | [Entrée]: Valider ---\033[0m"
-    
-    # Efface uniquement ce qui reste en dessous
     echo -ne "\033[J"
 }
 
@@ -222,7 +289,7 @@ while true; do
     display_menu
     read -rsn1 key
     if [[ $key == $'\x1b' ]]; then
-        read -rsn2 -t 0.1 key
+        read -rsn2 -t 0.5 key
         if [[ $key == "[A" ]]; then
             ((active_index--))
             [ $active_index -lt 0 ] && active_index=$((num_options - 1))
@@ -251,10 +318,10 @@ while true; do
     fi
 done
 
-tput cnorm 2>/dev/null
+tput cnorm 2>/dev/null || true
 
 # ==============================================================================
-# 5. SÉLECTION DE LA VARIANTE (GENERIC / LOWLATENCY)
+# 5. RECHERCHE DES PAQUETS ET SÉLECTION DE LA VARIANTE (GENERIC / LOWLATENCY)
 # ==============================================================================
 clear
 echo ""
@@ -266,35 +333,34 @@ echo -e " \033[1m   Version sélectionnée pour installation : \033[1;32m$site\0
 echo -e " \033[1;36m   Version du noyau actuellement chargée  : $(uname -r)\033[0m"
 echo ""
 echo -e " \033[1;32m   Noyaux actuellement installés dans /boot :\033[0m"
-ls /boot 2>/dev/null | grep initrd | cut -d- -f2,3,4 | sed 's/^/\t/'
+ls /boot 2>/dev/null | grep initrd | cut -d- -f2,3,4 | sed 's/^/\t/' || true
 echo ""
 
-prompt_msg=$(printf "\033[3m\tSouhaitez-vous installer la variante 'lowlatency' (y/n) ? \033[0m")
-echo -ne "$prompt_msg"
-
-while true; do
-    read -rsn1 key
-    case "$key" in
-        [yY]) low=1; choix="lowlatency"; echo "y"; break ;;
-        [nN]) low=0; choix="generic";    echo "n"; break ;;
-    esac
-done
-echo ""
-
-# ==============================================================================
-# 6. RECHERCHE DES PAQUETS ET VÉRIFICATION DE DISPONIBILITÉ
-# ==============================================================================
 echo -e "    \033[1;4;36m--- Recherche des paquets distants sur le serveur ---\033[0m"
 
-root_links=$(lynx -dump -listonly -nonumbers "${kernelURL}" 2>/dev/null)
+fetch_links() {
+    local target_url="$1"
+    curl -sL --connect-timeout 5 --max-time 10 -H "Cache-Control: no-cache" "$target_url" 2>/dev/null \
+        | grep -oE 'href="[^"]+"' \
+        | sed -E 's/^href="//; s/"$//' \
+        | while read -r href; do
+            if [[ "$href" =~ ^https?:// ]]; then
+                echo "$href"
+            elif [[ "$href" != \?* && "$href" != /* ]]; then
+                echo "${target_url%/}/${href#/}"
+            fi
+        done || true
+}
+
+root_links=$(fetch_links "${kernelURL}")
 
 if echo "$root_links" | grep -qE "_${arch}\.deb$"; then
-    mapfile -t liste_debs < <(echo "$root_links" | grep -E "\.deb$")
+    mapfile -t liste_debs < <(echo "$root_links" | grep -E "\.deb$" || true)
     pkg_base_url="${kernelURL}"
 else
     mapfile -t liste_debs < <(
-        lynx -dump -listonly -nonumbers "${kernelURL}${arch}/" 2>/dev/null | grep -E "\.deb$"
-        echo "$root_links" | grep -E "_all\.deb$"
+        fetch_links "${kernelURL}${arch}/" | grep -E "\.deb$" || true
+        echo "$root_links" | grep -E "_all\.deb$" || true
     )
     pkg_base_url="${kernelURL}${arch}/"
 fi
@@ -304,43 +370,74 @@ if [ ${#liste_debs[@]} -eq 0 ]; then
     exit 1
 fi
 
-if [ "$choix" == "lowlatency" ] && ! printf "%s\n" "${liste_debs[@]}" | grep -q "lowlatency"; then
-    echo -e "\t\033[1;31m⚠️  Note : Pas de paquets 'lowlatency' disponibles pour v.${site2}.\033[0m"
-    echo -e "\t\033[1;31m   Bascule automatique sur la variante 'generic'...\033[0m"
+# Inhiber la question lowlatency si aucun paquet lowlatency n'existe pour cette version
+has_lowlatency=0
+for u in "${liste_debs[@]}"; do
+    if [[ "$(basename "$u")" == *lowlatency* ]]; then
+        has_lowlatency=1
+        break
+    fi
+done
+
+if [ "$has_lowlatency" -eq 1 ]; then
+    if ask_yn "\033[3m\tSouhaitez-vous installer la variante 'lowlatency' (y/n) ? \033[0m"; then
+        low=1
+        choix="lowlatency"
+    else
+        low=0
+        choix="generic"
+    fi
     echo ""
-    choix="generic"
+else
     low=0
+    choix="generic"
+    echo -e "\t\033[0;36mℹ️  Variante 'lowlatency' non disponible pour $site : sélection automatique de 'generic'.\033[0m"
+    echo ""
 fi
 
-# Vérification si cette version et variante exactes sont déjà installées
 if ls /boot/initrd.img-"${site2}"*-"${choix}" >/dev/null 2>&1; then
-    echo ""
     echo -e " \033[1;31m   [ABANDON] Le noyau Linux $site ($choix) est déjà installé sur votre système !\033[0m"
     exit 0
 fi
 
-# Filtrage de la révision la plus récente et des paquets cibles
-latest_revision=$(printf "%s\n" "${liste_debs[@]}" | grep "$choix" | grep -oE "[0-9]{8,12}" | sort -V | tail -1)
-[ -z "$latest_revision" ] && latest_revision=$(printf "%s\n" "${liste_debs[@]}" | grep -oE "[0-9]{8,12}" | sort -V | tail -1)
+# Gestion sûre des révisions multiples (les headers_all.deb peuvent garder l'horodatage initial)
+latest_arch_rev=$(printf "%s\n" "${liste_debs[@]}" | grep -E "_${arch}\.deb$" | grep "$choix" | grep -oE "[0-9]{8,12}" | sort -V | tail -1 || true)
+latest_all_rev=$(printf "%s\n" "${liste_debs[@]}" | grep -E "_all\.deb$" | grep -oE "[0-9]{8,12}" | sort -V | tail -1 || true)
 
-if [ -z "$latest_revision" ]; then
-    mapfile -t target_urls < <(
-        printf "%s\n" "${liste_debs[@]}" | sort -u \
-        | grep -E "(_all\.deb|_${arch}\.deb)$" \
-        | grep -E "(linux-headers-.*_all\.deb|${choix})"
-    )
-else
-    mapfile -t target_urls < <(
-        printf "%s\n" "${liste_debs[@]}" | sort -u \
-        | grep -E "(_all\.deb|_${arch}\.deb)$" \
-        | grep "$latest_revision" \
-        | grep -E "(linux-headers-.*_all\.deb|${choix})"
-    )
-fi
+mapfile -t target_urls < <(
+    {
+        if [ -n "$latest_arch_rev" ]; then
+            printf "%s\n" "${liste_debs[@]}" | grep -E "_${arch}\.deb$" | grep "$choix" | grep "$latest_arch_rev" || true
+        else
+            printf "%s\n" "${liste_debs[@]}" | grep -E "_${arch}\.deb$" | grep "$choix" || true
+        fi
+
+        if [ -n "$latest_all_rev" ]; then
+            printf "%s\n" "${liste_debs[@]}" | grep -E "linux-headers-.*_all\.deb$" | grep "$latest_all_rev" || true
+        else
+            printf "%s\n" "${liste_debs[@]}" | grep -E "linux-headers-.*_all\.deb$" || true
+        fi
+    } | sort -u
+)
 
 if [ ${#target_urls[@]} -eq 0 ]; then
     echo -e "\t\033[1;31mErreur : Impossible d'identifier les paquets à télécharger.\033[0m"
     exit 1
+fi
+
+# Vérification de la complétude du build (image, modules, headers)
+has_image=$(printf "%s\n" "${target_urls[@]}" | grep -c "linux-image-" || true)
+has_modules=$(printf "%s\n" "${target_urls[@]}" | grep -c "linux-modules-" || true)
+has_headers=$(printf "%s\n" "${target_urls[@]}" | grep -c "linux-headers-" || true)
+
+if [ "$has_image" -eq 0 ] || [ "$has_modules" -eq 0 ] || [ "$has_headers" -lt 2 ]; then
+    echo -e "\t\033[1;33m⚠️  [AVERTISSEMENT BUILD INCOMPLET]\033[0m"
+    echo -e "\t\033[0;33m   Certains composants habituels semblent absents (image:$has_image, modules:$has_modules, headers:$has_headers).\033[0m"
+    echo -e "\t\033[0;33m   La compilation sur les serveurs Ubuntu Mainline a peut-être échoué partiellement.\033[0m"
+    if ! ask_yn "\tContinuer malgré tout (y/n) ? "; then
+        exit 1
+    fi
+    echo ""
 fi
 
 echo -e " \033[1;3;32m   Noyau prêt pour téléchargement : $site ($choix)\033[0m"
@@ -359,24 +456,9 @@ while true; do
 done
 
 # ==============================================================================
-# 7. TÉLÉCHARGEMENT ET VÉRIFICATION CRYPTOGRAPHIQUE (GPG + SHA256)
+# 6. TÉLÉCHARGEMENT ET VÉRIFICATION CRYPTOGRAPHIQUE (GPG + SHA256)
 # ==============================================================================
 cd "$TEMP_DIR" || exit 1
-
-# Vérification de l'espace disque disponible (en Mo) avant téléchargement
-free_boot=$(df -m /boot | awk 'NR==2 {print $4}')
-free_tmp=$(df -m "$TEMP_DIR" | awk 'NR==2 {print $4}')
-
-if [ "$free_boot" -lt 150 ]; then
-    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans /boot (${free_boot} Mo libres, 150 Mo requis) !\033[0m"
-    echo -e " \033[1;33mSupprimez d'anciens noyaux avant de continuer pour éviter de bloquer GRUB.\033[0m"
-    exit 1
-fi
-
-if [ "$free_tmp" -lt 300 ]; then
-    echo -e " \033[1;31m[ALERTE] Espace insuffisant dans $TEMP_DIR (${free_tmp} Mo libres, 300 Mo requis) !\033[0m"
-    exit 1
-fi
 
 echo ""
 echo -e " \033[1;32m\tTéléchargement des paquets dans : $TEMP_DIR\033[0m"
@@ -392,82 +474,141 @@ done
 echo ""
 echo -e " \033[1;36m\tVérification de l'authenticité et de l'intégrité (GPG & SHA256)...\033[0m"
 
-CHECKSUM_URL=""
-if echo "$root_links" | grep -q "CHECKSUMS$"; then
-    CHECKSUM_URL="${kernelURL}"
-elif lynx -dump -listonly -nonumbers "${pkg_base_url}" 2>/dev/null | grep -q "CHECKSUMS$"; then
-    CHECKSUM_URL="${pkg_base_url}"
+# Téléchargement des fichiers de contrôle (sous-dossier arch + racine)
+curl -fsSL --connect-timeout 5 --max-time 10 "${pkg_base_url}CHECKSUMS" -o CHECKSUMS_ARCH 2>/dev/null || rm -f CHECKSUMS_ARCH
+curl -fsSL --connect-timeout 5 --max-time 10 "${pkg_base_url}CHECKSUMS.gpg" -o CHECKSUMS_ARCH.gpg 2>/dev/null || rm -f CHECKSUMS_ARCH.gpg
+curl -fsSL --connect-timeout 5 --max-time 10 "${kernelURL}CHECKSUMS" -o CHECKSUMS_ROOT 2>/dev/null || rm -f CHECKSUMS_ROOT
+curl -fsSL --connect-timeout 5 --max-time 10 "${kernelURL}CHECKSUMS.gpg" -o CHECKSUMS_ROOT.gpg 2>/dev/null || rm -f CHECKSUMS_ROOT.gpg
+
+# Détection intelligente : signature détachée (.gpg) OU signature interne (clearsigned)
+SIG_FILE=""
+DATA_FILE=""
+IS_CLEARSIGNED=0
+
+if [ -s CHECKSUMS_ARCH ] && [ -s CHECKSUMS_ARCH.gpg ]; then
+    DATA_FILE="CHECKSUMS_ARCH"
+    SIG_FILE="CHECKSUMS_ARCH.gpg"
+elif [ -s CHECKSUMS_ROOT ] && [ -s CHECKSUMS_ROOT.gpg ]; then
+    DATA_FILE="CHECKSUMS_ROOT"
+    SIG_FILE="CHECKSUMS_ROOT.gpg"
+elif [ -s CHECKSUMS_ARCH ] && grep -q "^-----BEGIN PGP SIGNED MESSAGE-----" CHECKSUMS_ARCH; then
+    DATA_FILE="CHECKSUMS_ARCH"
+    IS_CLEARSIGNED=1
+elif [ -s CHECKSUMS_ROOT ] && grep -q "^-----BEGIN PGP SIGNED MESSAGE-----" CHECKSUMS_ROOT; then
+    DATA_FILE="CHECKSUMS_ROOT"
+    IS_CLEARSIGNED=1
 fi
 
-if [ -n "$CHECKSUM_URL" ]; then
-    wget -q "${CHECKSUM_URL}CHECKSUMS" -O CHECKSUMS
-    wget -q "${CHECKSUM_URL}CHECKSUMS.gpg" -O CHECKSUMS.gpg
+gpg_valid=0
+if [ -n "$DATA_FILE" ]; then
+    export GNUPGHOME="$TEMP_DIR/.gnupg"
+    mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
 
-    if [ -s CHECKSUMS ] && [ -s CHECKSUMS.gpg ]; then
-        export GNUPGHOME="$TEMP_DIR/.gnupg"
-        mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+    [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ] && gpg --import /usr/share/keyrings/ubuntu-archive-keyring.gpg >/dev/null 2>&1 || true
 
-        # 1. Importation du trousseau officiel d'Ubuntu
-        [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ] && gpg --import /usr/share/keyrings/ubuntu-archive-keyring.gpg >/dev/null 2>&1
-
-        # 2. Téléchargement et importation de la clé Kernel PPA
-        KS_HOST="keyserver.ubuntu.com"
-        UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
-        curl -kfsSL "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null
-        [ -s key.asc ] && gpg --import key.asc >/dev/null 2>&1
-
-        # 3. Vérification de la signature GPG
-        GPG_OUTPUT=$(gpg --verify CHECKSUMS.gpg CHECKSUMS 2>&1)
-        GPG_STATUS=$?
-
-        if [ $GPG_STATUS -eq 0 ]; then
-            echo -e "\t\033[1;32m✔ Signature GPG valide (Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
-        elif echo "$GPG_OUTPUT" | grep -qiE "expired|expirée"; then
-            echo -e "\t\033[1;32m✔ Signature GPG authentique (clé d'archive expirée, normal pour ce noyau).\033[0m"
+    KS_HOST="keyserver.ubuntu.com"
+    UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
+    if curl -fsSL --connect-timeout 5 --max-time 10 "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null && [ -s key.asc ]; then
+        if gpg --with-colons --import-options show-only --import key.asc 2>/dev/null | grep -q "fpr:::::::::${UBUNTU_KERNEL_KEY}:"; then
+            gpg --import key.asc >/dev/null 2>&1 || true
         else
-            echo -e "\t\033[1;33m⚠️  Échec GPG : $(echo "$GPG_OUTPUT" | tail -n 1)\033[0m"
-            read -rp "	Continuer malgré tout avec la vérification SHA256 uniquement (y/N) ? " bypass_gpg
-            [[ ! "$bypass_gpg" =~ ^[yY]$ ]] && exit 1
+            echo -e "\t\033[1;31m[ALERTE SÉCURITÉ] Empreinte de la clé GPG téléchargée non conforme !\033[0m"
         fi
+    fi
 
-        # 4. Vérification stricte des empreintes SHA256 des paquets téléchargés
-        sha_failed=0
-        for deb in *.deb; do
-            expected_sha=$(grep -E "[a-fA-F0-9]{64}.*${deb}$" CHECKSUMS | awk '{print $1}' | head -1)
-            if [ -n "$expected_sha" ]; then
-                actual_sha=$(sha256sum "$deb" | awk '{print $1}')
-                if [ "$expected_sha" == "$actual_sha" ]; then
-                    echo -e "\t\033[1;32m✔ SHA256 OK : \033[0m $deb"
-                else
-                    echo -e "\t\033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
-                    sha_failed=1
-                fi
-            fi
-        done
+    if [ "$IS_CLEARSIGNED" -eq 1 ]; then
+        GPG_STATUS_OUT=$(LC_ALL=C gpg --status-fd 1 --output CHECKSUMS_EXTRACTED --decrypt "$DATA_FILE" 2>&1 || true)
+        [ -s CHECKSUMS_EXTRACTED ] && DATA_FILE="CHECKSUMS_EXTRACTED"
+    else
+        GPG_STATUS_OUT=$(LC_ALL=C gpg --status-fd 1 --verify "$SIG_FILE" "$DATA_FILE" 2>&1 || true)
+    fi
 
-        if [ "$sha_failed" -eq 1 ]; then
-            echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée.\033[0m"
+    if echo "$GPG_STATUS_OUT" | grep -q "^\[GNUPG:\] GOODSIG"; then
+        echo -e "\t\033[1;32m✔ Signature GPG valide (Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
+        gpg_valid=1
+    elif echo "$GPG_STATUS_OUT" | grep -q "^\[GNUPG:\] EXPKEYSIG"; then
+        echo -e "\t\033[1;32m✔ Signature GPG authentique (clé d'archive expirée, normal pour ce noyau).\033[0m"
+        gpg_valid=1
+    else
+        echo -e "\t\033[1;33m⚠️  Échec de vérification GPG : $(echo "$GPG_STATUS_OUT" | grep -v "^\[GNUPG:\]" | tail -n 1)\033[0m"
+        if ! ask_yn "\tContinuer malgré tout (y/n) ? "; then
             exit 1
         fi
     fi
-else
-    echo -e "\t\033[1;33m⚠️  Fichiers CHECKSUMS absents pour cette version ancienne.\033[0m"
+
+    # Sécurité stricte : utiliser uniquement le fichier DATA_FILE authentifié par GPG
+    tr -d '\r' < "$DATA_FILE" | awk '
+        length($1) == 64 && $1 ~ /^[a-fA-F0-9]+$/ {
+            file = $NF
+            sub(/^.*\//, "", file)
+            sub(/^\*/, "", file)
+            print tolower($1) "  " file
+        }
+    ' > CHECKSUMS_CLEAN
+
+    sha_failed=0
+    for deb in *.deb; do
+        matched_line=$(awk -v f="$deb" '$2 == f { print $0; exit }' CHECKSUMS_CLEAN)
+        if [ -n "$matched_line" ]; then
+            if printf "%s\n" "$matched_line" | sha256sum --status -c - 2>/dev/null; then
+                echo -e "\t\033[1;32m✔ SHA256 OK : \033[0m $deb"
+            else
+                echo -e "\t\033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
+                sha_failed=1
+            fi
+        fi
+    done
+
+    if [ "$sha_failed" -eq 1 ]; then
+        echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée.\033[0m"
+        exit 1
+    fi
+elif [ -s CHECKSUMS_ARCH ] || [ -s CHECKSUMS_ROOT ]; then
+    # Cas où CHECKSUMS existe sans signature GPG associée : vérification silencieuse si absent, affichage si présent et valide
+    cat CHECKSUMS_ARCH CHECKSUMS_ROOT 2>/dev/null | tr -d '\r' | awk '
+        length($1) == 64 && $1 ~ /^[a-fA-F0-9]+$/ {
+            file = $NF
+            sub(/^.*\//, "", file)
+            sub(/^\*/, "", file)
+            print tolower($1) "  " file
+        }
+    ' > CHECKSUMS_CLEAN
+
+    sha_failed=0
+    for deb in *.deb; do
+        matched_line=$(awk -v f="$deb" '$2 == f { print $0; exit }' CHECKSUMS_CLEAN)
+        if [ -n "$matched_line" ]; then
+            if printf "%s\n" "$matched_line" | sha256sum --status -c - 2>/dev/null; then
+                echo -e "\t\033[1;32m✔ SHA256 OK : \033[0m $deb"
+            else
+                echo -e "\t\033[1;31m✘ SHA256 INVALIDE : \033[0m $deb"
+                sha_failed=1
+            fi
+        fi
+    done
+
+    if [ "$sha_failed" -eq 1 ]; then
+        echo -e " \033[1;31m[ERREUR CRITIQUE] Fichier(s) corrompu(s). Installation annulée.\033[0m"
+        exit 1
+    fi
 fi
 
 # ==============================================================================
-# 8. INSTALLATION DU NOUVEAU NOYAU ET MISE À JOUR DE GRUB
+# 7. INSTALLATION DU NOUVEAU NOYAU ET MISE À JOUR DE GRUB
 # ==============================================================================
 echo ""
 read -rp " [Entrée] pour installer le noyau $site ($choix) ou [CTRL]-[C] pour annuler... "
 echo ""
 
-echo -e " \033[1;36m\tInstallation des paquets .deb en cours...\033[0m"
-if ! sudo dpkg -i *.deb; then
-    echo -e " \033[1;33m\t⚠️  Dépendances manquantes détectées, tentative de réparation avec apt...\033[0m"
-    sudo apt-get install -f -y || {
-        echo -e " \033[1;31m[ERREUR] Échec de l'installation du noyau.\033[0m"
-        exit 1
-    }
+if ! sudo -v; then
+    echo -e " \033[1;31m[ERREUR] Privilèges administrateur (sudo) requis pour l'installation.\033[0m"
+    exit 1
+fi
+
+echo -e " \033[1;36m\tInstallation des paquets .deb via apt (résolution des dépendances)...\033[0m"
+if ! sudo apt-get install -y --allow-downgrades ./*.deb; then
+    echo -e " \033[1;31m[ERREUR] Échec de l'installation du noyau (dépendances incompatibles ou paquet bloqué).\033[0m"
+    exit 1
 fi
 
 echo ""
@@ -483,8 +624,7 @@ echo -e " \033[1;32m✔ Installation du noyau $site ($choix) terminée avec succ
 echo -e " \033[1;33m\tUn redémarrage est nécessaire pour charger le nouveau noyau.\033[0m"
 echo ""
 
-read -rp "	Voulez-vous redémarrer l'ordinateur maintenant (y/N) ? " reboot_now
-if [[ "$reboot_now" =~ ^[yY]$ ]]; then
+if ask_yn "\tVoulez-vous redémarrer l'ordinateur maintenant (y/n) ? "; then
     echo -e " \033[1;36m\tRedémarrage du système...\033[0m"
     sudo reboot
 else
