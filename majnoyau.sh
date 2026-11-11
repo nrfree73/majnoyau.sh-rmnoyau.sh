@@ -218,6 +218,15 @@ page_size=60
 page_step=1
 max_pages=$(( (total_versions + page_size - 1) / page_size ))
 
+update_grid_dimensions() {
+    local term_cols
+    term_cols=$(tput cols 2>/dev/null || echo 120)
+    cols=$(( term_cols / 22 ))
+    [ "$cols" -lt 1 ] && cols=1
+    [ "$cols" -gt 5 ] && cols=5
+    rows=$(( (num_options + cols - 1) / cols ))
+}
+
 load_kernel_page() {
     local start_idx=$(( total_versions - (page_step * page_size) ))
     local count=$page_size
@@ -227,8 +236,7 @@ load_kernel_page() {
     fi
     versions_list=( "${all_versions[@]:$start_idx:$count}" )
     num_options=${#versions_list[@]}
-    cols=5
-    rows=$(( (num_options + cols - 1) / cols ))
+    update_grid_dimensions
 }
 
 clear
@@ -257,6 +265,7 @@ print_header() {
 }
 
 display_menu() {
+    update_grid_dimensions
     local r c idx
     local term_cols
     term_cols=$(tput cols 2>/dev/null || echo 120)
@@ -402,7 +411,7 @@ else
     echo ""
 fi
 
-if ls /boot/initrd.img-"${site2}"*-"${choix}" >/dev/null 2>&1; then
+if ls /boot/initrd.img-"${site2}"-*-"${choix}" >/dev/null 2>&1; then
     echo -e " \033[1;31m   [ABANDON] Le noyau Linux $site ($choix) est déjà installé sur votre système !\033[0m"
     exit 0
 fi
@@ -504,7 +513,7 @@ mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
 KS_HOST="keyserver.ubuntu.com"
 UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
 if curl -fsSL --connect-timeout 5 --max-time 10 "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null && [ -s key.asc ]; then
-    if gpg --with-colons --import-options show-only --import key.asc 2>/dev/null | grep -q "fpr:::::::::${UBUNTU_KERNEL_KEY}:"; then
+    if gpg --with-colons --import-options show-only --import key.asc 2>/dev/null | grep -q "^fpr:.*:${UBUNTU_KERNEL_KEY}:"; then
         gpg --import key.asc >/dev/null 2>&1 || true
     else
         echo -e "\t\033[1;31m[ALERTE SÉCURITÉ] Empreinte de la clé GPG téléchargée non conforme !\033[0m"
