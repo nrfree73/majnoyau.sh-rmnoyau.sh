@@ -16,7 +16,11 @@ TEMP_DIR=$(mktemp -d /tmp/kernel_update_XXXXXX) || {
     exit 1
 }
 
+CLEANUP_DONE=0
 cleanup() {
+    [ "$CLEANUP_DONE" -eq 1 ] && return
+    CLEANUP_DONE=1
+
     tput cnorm 2>/dev/null || true
     stty sane 2>/dev/null || true
 
@@ -31,6 +35,7 @@ cleanup() {
 on_interrupt() {
     echo ""
     echo -e " \033[1;33mInterrupted by user (CTRL+C). Cleaning up...\033[0m"
+    cleanup
     exit 130
 }
 
@@ -133,7 +138,9 @@ if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     echo "Installing missing dependencies: ${MISSING_PKGS[*]}..."
     sudo apt-get update -qq && sudo apt-get install -y "${MISSING_PKGS[@]}"
     for pkg in "${MISSING_PKGS[@]}"; do
-        if ! command -v "$pkg" >/dev/null 2>&1 && [ "$pkg" != "gnupg" ]; then
+        bin_check="$pkg"
+        [ "$pkg" = "gnupg" ] && bin_check="gpg"
+        if ! command -v "$bin_check" >/dev/null 2>&1; then
             echo "Failed to install package '$pkg'! Press [Enter] to exit..."
             read -r
             exit 1
@@ -187,7 +194,7 @@ if [ "$total_versions" -eq 0 ]; then
     exit 1
 fi
 
-check_count=5
+check_count=8
 [ "$total_versions" -lt "$check_count" ] && check_count=$total_versions
 
 for ((i = total_versions - 1; i >= total_versions - check_count; i--)); do
@@ -401,9 +408,9 @@ if ls /boot/initrd.img-"${site2}"*-"${choix}" >/dev/null 2>&1; then
     exit 0
 fi
 
-# Safe handling of multiple revisions (headers_all.deb may retain initial build timestamp)
-latest_arch_rev=$(printf "%s\n" "${liste_debs[@]}" | grep -E "_${arch}\.deb$" | grep "$choix" | grep -oE "[0-9]{8,12}" | sort -V | tail -1 || true)
-latest_all_rev=$(printf "%s\n" "${liste_debs[@]}" | grep -E "_all\.deb$" | grep -oE "[0-9]{8,12}" | sort -V | tail -1 || true)
+# Safe handling of multiple revisions (match timestamp in basename only)
+latest_arch_rev=$(printf "%s\n" "${liste_debs[@]}" | xargs -r -n1 basename | grep -E "_${arch}\.deb$" | grep "$choix" | grep -oE "\.[0-9]{10,12}_" | tr -d '._' | sort -V | tail -1 || true)
+latest_all_rev=$(printf "%s\n" "${liste_debs[@]}" | xargs -r -n1 basename | grep -E "_all\.deb$" | grep -oE "\.[0-9]{10,12}_" | tr -d '._' | sort -V | tail -1 || true)
 
 mapfile -t target_urls < <(
     {
@@ -493,50 +500,64 @@ if curl -fsSL --connect-timeout 5 --max-time 10 "https://${KS_HOST}/pks/lookup?o
     if gpg --with-colons --import-options show-only --import key.asc 2>/dev/null | grep -q "fpr:::::::::${UBUNTU_KERNEL_KEY}:"; then
         gpg --import key.asc >/dev/null 2>&1 || true
     else
-        echo -e "\t\033[1;31m[SECURITY ALERT] Downloaded GPG key fingerprint mismatch!\033[0m"
+        echo -e "\t\033[1;31m[SECURITY ALERT] Downloaded GPG key fingerprint mismatch! Aborting.\033[0m"
+        exit 1
     fi
 fi
 
-# Detect detached signature (.gpg) or inline clearsigned signature
-VERIFIED_DATA_FILE=""
-gpg_valid=0
+# Verify detached signature (.gpg) or inline clearsigned signature for both ARCH and ROOT
+verify_checksum_file() {
+    local raw_file="$1"
+    local sig_file="$2"
+    local out_file="$3"
+    local label="$4"
 
-if [ -s CHECKSUMS_ARCH ] && [ -s CHECKSUMS_ARCH.gpg ]; then
-    GPG_STATUS_OUT=$(LC_ALL=C gpg --status-fd 1 --verify CHECKSUMS_ARCH.gpg CHECKSUMS_ARCH 2>&1 || true)
-    VERIFIED_DATA_FILE="CHECKSUMS_ARCH"
-elif [ -s CHECKSUMS_ROOT ] && [ -s CHECKSUMS_ROOT.gpg ]; then
-    GPG_STATUS_OUT=$(LC_ALL=C gpg --status-fd 1 --verify CHECKSUMS_ROOT.gpg CHECKSUMS_ROOT 2>&1 || true)
-    VERIFIED_DATA_FILE="CHECKSUMS_ROOT"
-elif [ -s CHECKSUMS_ARCH ] && grep -q "BEGIN PGP SIGNED MESSAGE" CHECKSUMS_ARCH; then
-    GPG_STATUS_OUT=$(LC_ALL=C gpg --status-fd 1 --decrypt CHECKSUMS_ARCH > CHECKSUMS_ARCH_EXTRACTED 2>&1 || true)
-    [ -s CHECKSUMS_ARCH_EXTRACTED ] && VERIFIED_DATA_FILE="CHECKSUMS_ARCH_EXTRACTED"
-elif [ -s CHECKSUMS_ROOT ] && grep -q "BEGIN PGP SIGNED MESSAGE" CHECKSUMS_ROOT; then
-    GPG_STATUS_OUT=$(LC_ALL=C gpg --status-fd 1 --decrypt CHECKSUMS_ROOT > CHECKSUMS_ROOT_EXTRACTED 2>&1 || true)
-    [ -s CHECKSUMS_ROOT_EXTRACTED ] && VERIFIED_DATA_FILE="CHECKSUMS_ROOT_EXTRACTED"
-fi
+    [ ! -s "$raw_file" ] && return 1
 
-if [ -n "$VERIFIED_DATA_FILE" ]; then
-    if echo "$GPG_STATUS_OUT" | grep -q "^\[GNUPG:\] GOODSIG"; then
-        echo -e "\t\033[1;32m✔ Valid GPG signature (Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
-        gpg_valid=1
-    elif echo "$GPG_STATUS_OUT" | grep -q "^\[GNUPG:\] EXPKEYSIG"; then
-        echo -e "\t\033[1;32m✔ Authentic GPG signature (archive key expired, expected for older kernels).\033[0m"
-        gpg_valid=1
+    local gpg_status=""
+    if [ -s "$sig_file" ]; then
+        gpg_status=$(LC_ALL=C gpg --status-fd 1 --verify "$sig_file" "$raw_file" 2>&1 || true)
+        cp "$raw_file" "$out_file"
+    elif grep -q "BEGIN PGP SIGNED MESSAGE" "$raw_file"; then
+        gpg_status=$(LC_ALL=C gpg --status-fd 2 --decrypt "$raw_file" > "$out_file" 2>&1 || true)
     else
-        echo -e "\t\033[1;33m⚠️  GPG verification failed: $(echo "$GPG_STATUS_OUT" | grep -v "^\[GNUPG:\]" | tail -n 1)\033[0m"
+        cp "$raw_file" "$out_file"
+        echo -e "\t\033[1;33m⚠️  Unsigned CHECKSUMS ($label).\033[0m"
+        return 0
+    fi
+
+    if echo "$gpg_status" | grep -q "^\[GNUPG:\] VALIDSIG"; then
+        echo -e "\t\033[1;32m✔ Valid GPG signature ($label - Kernel PPA <kernel-ppa@canonical.com>).\033[0m"
+        return 0
+    elif echo "$gpg_status" | grep -q "^\[GNUPG:\] EXPKEYSIG"; then
+        echo -e "\t\033[1;32m✔ Authentic GPG signature ($label - archive key expired, expected for older kernels).\033[0m"
+        return 0
+    else
+        echo -e "\t\033[1;33m⚠️  GPG verification failed ($label): $(echo "$gpg_status" | grep -v "^\[GNUPG:\]" | tail -n 1)\033[0m"
         if ! ask_yn "\tContinue anyway (y/n)? "; then
             exit 1
         fi
+        return 0
     fi
-elif [ -s CHECKSUMS_ARCH ]; then
-    VERIFIED_DATA_FILE="CHECKSUMS_ARCH"
-elif [ -s CHECKSUMS_ROOT ]; then
-    VERIFIED_DATA_FILE="CHECKSUMS_ROOT"
+}
+
+: > COMBINED_CHECKSUMS
+has_checksums=0
+
+if verify_checksum_file "CHECKSUMS_ARCH" "CHECKSUMS_ARCH.gpg" "VERIFIED_ARCH" "arch"; then
+    cat VERIFIED_ARCH >> COMBINED_CHECKSUMS
+    echo "" >> COMBINED_CHECKSUMS
+    has_checksums=1
 fi
 
-# Verify SHA256 hashes if a CHECKSUMS file is available (silent if absent)
-if [ -n "$VERIFIED_DATA_FILE" ] && [ -s "$VERIFIED_DATA_FILE" ]; then
-    tr -d '\r' < "$VERIFIED_DATA_FILE" | awk '
+if verify_checksum_file "CHECKSUMS_ROOT" "CHECKSUMS_ROOT.gpg" "VERIFIED_ROOT" "root"; then
+    cat VERIFIED_ROOT >> COMBINED_CHECKSUMS
+    echo "" >> COMBINED_CHECKSUMS
+    has_checksums=1
+fi
+
+if [ "$has_checksums" -eq 1 ] && [ -s COMBINED_CHECKSUMS ]; then
+    tr -d '\r' < COMBINED_CHECKSUMS | awk '
         length($1) == 64 && $1 ~ /^[a-fA-F0-9]+$/ {
             file = $NF
             sub(/^.*\//, "", file)
@@ -546,6 +567,8 @@ if [ -n "$VERIFIED_DATA_FILE" ] && [ -s "$VERIFIED_DATA_FILE" ]; then
     ' > CHECKSUMS_CLEAN
 
     sha_failed=0
+    missing_hashes=()
+
     for deb in *.deb; do
         matched_line=$(awk -v f="$deb" '$2 == f { print $0; exit }' CHECKSUMS_CLEAN)
         if [ -n "$matched_line" ]; then
@@ -555,13 +578,33 @@ if [ -n "$VERIFIED_DATA_FILE" ] && [ -s "$VERIFIED_DATA_FILE" ]; then
                 echo -e "\t\033[1;31m✘ SHA256 INVALID: \033[0m $deb"
                 sha_failed=1
             fi
+        else
+            missing_hashes+=("$deb")
         fi
     done
 
     if [ "$sha_failed" -eq 1 ]; then
-        echo -e " \033[1;31m[CRITICAL ERROR] Corrupted file(s) detected. Installation aborted.\033[0m"
+        echo -e " \033[1;31m[CRITICAL ERROR] Corrupted .deb file(s) detected. Installation aborted.\033[0m"
         exit 1
     fi
+
+    if [ ${#missing_hashes[@]} -gt 0 ]; then
+        echo -e "\t\033[1;33m⚠️  [NO .DEB HASHES PUBLISHED ON SERVER]\033[0m"
+        echo -e "\t\033[0;33m   Canonical only signed build metadata in CHECKSUMS (no SHA256 published for .deb files):\033[0m"
+        for m in "${missing_hashes[@]}"; do
+            echo -e "\t\033[0;33m     - $m\033[0m"
+        done
+        if ! ask_yn "\tProceed with installation over verified HTTPS (y/n)? "; then
+            exit 1
+        fi
+        echo ""
+    fi
+else
+    echo -e "\t\033[1;33m⚠️  [WARNING] No CHECKSUMS file available on the server for this version.\033[0m"
+    if ! ask_yn "\tContinue without SHA256 verification (y/n)? "; then
+        exit 1
+    fi
+    echo ""
 fi
 
 # ==============================================================================
