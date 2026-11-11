@@ -5,7 +5,7 @@
 # Mise à jour & Refonte : 2026-11 (HTTPS, Grille, Anti-Cache, GPG/SHA256, DKMS/UEFI)
 # ==============================================================================
 
-set -o pipefail
+set -euo pipefail
 clear
 
 # ==============================================================================
@@ -24,10 +24,10 @@ cleanup() {
     tput cnorm 2>/dev/null || true
     stty sane 2>/dev/null || true
 
-    if [ -d "$TEMP_DIR/.gnupg" ]; then
+    if [ -d "${TEMP_DIR:-}/.gnupg" ]; then
         GNUPGHOME="$TEMP_DIR/.gnupg" gpgconf --kill all >/dev/null 2>&1 || true
     fi
-    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+    if [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR"
     fi
 }
@@ -45,10 +45,10 @@ trap on_interrupt INT TERM
 # Fonction de confirmation stricte : n'accepte uniquement que les touches y/Y ou n/N
 ask_yn() {
     local prompt="$1"
-    local ans
+    local ans=""
     echo -ne "$prompt"
     while true; do
-        read -rsn1 ans
+        read -rsn1 ans || true
         case "$ans" in
             [yY]) echo "y"; return 0 ;;
             [nN]) echo "n"; return 1 ;;
@@ -57,7 +57,7 @@ ask_yn() {
 }
 
 # ==============================================================================
-# 2. VÉRIFICATION DE L'ESPACE DISQUE, DU RÉSEAU, SECURE BOOT, DKMS ET DÉPENDANCES
+# 2. VÉRIFICATION DE L'ESPACE DISQUE, DU RÉSEAU, DÉPENDANCES, SECURE BOOT ET DKMS
 # ==============================================================================
 free_boot=$(df -Pm /boot | awk 'NR==2 {print $4}')
 free_tmp=$(df -Pm "$TEMP_DIR" | awk 'NR==2 {print $4}')
@@ -65,9 +65,9 @@ free_tmp=$(df -Pm "$TEMP_DIR" | awk 'NR==2 {print $4}')
 if [ "$free_boot" -lt 250 ]; then
     echo -e " \033[1;31m[ALERTE] Espace insuffisant dans /boot (${free_boot} Mo libres, 250 Mo requis) !\033[0m"
     echo -e " \033[1;33mSupprimez d'anciens noyaux pour éviter de bloquer GRUB lors de l'installation.\033[0m"
-    if ask_yn " Voulez-vous exécuter 'sudo apt-get autoremove --purge' maintenant (y/n) ? "; then
+    if ask_yn " Voulez-vous exécuter 'sudo apt-get autoremove --purge' de manière interactive maintenant (y/n) ? "; then
         echo ""
-        sudo apt-get autoremove --purge -y
+        sudo apt-get autoremove --purge || true
         free_boot=$(df -Pm /boot | awk 'NR==2 {print $4}')
         if [ "$free_boot" -lt 250 ]; then
             echo -e " \033[1;31mEspace toujours insuffisant dans /boot (${free_boot} Mo libres). Abandon.\033[0m"
@@ -90,7 +90,7 @@ if command -v curl >/dev/null 2>&1; then
     network_ok=$(curl -sI --connect-timeout 5 --max-time 8 https://kernel.ubuntu.com/mainline/ >/dev/null 2>&1 && echo "1" || echo "0")
 else
     gw=$(ip r | awk '/default/ {print $3; exit}')
-    network_ok=$([ -n "$gw" ] && ping -q -w 2 -c 1 "$gw" >/dev/null 2>&1 && echo "1" || echo "0")
+    network_ok=$([ -n "${gw:-}" ] && ping -q -w 2 -c 1 "$gw" >/dev/null 2>&1 && echo "1" || echo "0")
 fi
 
 if [ "$network_ok" == "0" ]; then
@@ -101,6 +101,27 @@ if [ "$network_ok" == "0" ]; then
 fi
 echo -e "\033[1;32mOK\033[0m"
 echo ""
+
+# Installation précoce des outils requis (wget, gnupg, curl)
+MISSING_PKGS=()
+command -v wget >/dev/null 2>&1 || MISSING_PKGS+=("wget")
+command -v gpg  >/dev/null 2>&1 || MISSING_PKGS+=("gnupg")
+command -v curl >/dev/null 2>&1 || MISSING_PKGS+=("curl")
+
+if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
+    echo "Installation des dépendances manquantes : ${MISSING_PKGS[*]}..."
+    sudo apt-get update -qq && sudo apt-get install -y "${MISSING_PKGS[@]}"
+    for pkg in "${MISSING_PKGS[@]}"; do
+        bin_name="$pkg"
+        [ "$pkg" == "gnupg" ] && bin_name="gpg"
+        if ! command -v "$bin_name" >/dev/null 2>&1; then
+            echo "Échec de l'installation du paquet '$pkg' (commande '$bin_name' introuvable) ! [Entrée] pour quitter..."
+            read -r
+            exit 1
+        fi
+    done
+    echo ""
+fi
 
 # Vérification du Secure Boot UEFI
 if command -v mokutil >/dev/null 2>&1; then
@@ -126,26 +147,6 @@ if command -v dkms >/dev/null 2>&1; then
         read -rp "   Appuyez sur [Entrée] pour continuer ou [CTRL]-[C] pour annuler... "
         echo ""
     fi
-fi
-
-# Installation des outils requis (wget, gnupg, curl)
-MISSING_PKGS=()
-command -v wget >/dev/null 2>&1 || MISSING_PKGS+=("wget")
-command -v gpg  >/dev/null 2>&1 || MISSING_PKGS+=("gnupg")
-command -v curl >/dev/null 2>&1 || MISSING_PKGS+=("curl")
-
-if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
-    echo "Installation des dépendances manquantes : ${MISSING_PKGS[*]}..."
-    sudo apt-get update -qq && sudo apt-get install -y "${MISSING_PKGS[@]}"
-    for pkg in "${MISSING_PKGS[@]}"; do
-        bin_name="$pkg"
-        [ "$pkg" == "gnupg" ] && bin_name="gpg"
-        if ! command -v "$bin_name" >/dev/null 2>&1; then
-            echo "Échec de l'installation du paquet '$pkg' (commande '$bin_name' introuvable) ! [Entrée] pour quitter..."
-            read -r
-            exit 1
-        fi
-    done
 fi
 
 # ==============================================================================
@@ -303,14 +304,14 @@ display_menu() {
 
 while true; do
     display_menu
-    read -rsn1 key
+    read -rsn1 key || true
     if [[ $key == $'\x1b' ]]; then
-        read -rsn2 -t 0.5 key
+        read -rsn2 -t 0.5 key || true
         if [[ $key == "[A" ]]; then
-            ((active_index--))
+            ((active_index--)) || true
             [ $active_index -lt 0 ] && active_index=$((num_options - 1))
         elif [[ $key == "[B" ]]; then
-            ((active_index++))
+            ((active_index++)) || true
             [ $active_index -ge $num_options ] && active_index=0
         elif [[ $key == "[D" ]]; then
             [ $active_index -ge $rows ] && active_index=$(( active_index - rows ))
@@ -319,13 +320,13 @@ while true; do
         fi
     elif [[ $key == "-" ]]; then
         if [ $page_step -lt $max_pages ]; then
-            ((page_step++))
+            ((page_step++)) || true
             load_kernel_page
             active_index=0
         fi
     elif [[ $key == "+" ]]; then
         if [ $page_step -gt 1 ]; then
-            ((page_step--))
+            ((page_step--)) || true
             load_kernel_page
             active_index=0
         fi
@@ -350,6 +351,10 @@ echo -e " \033[1;36m   Version du noyau actuellement chargée  : $(uname -r)\033
 echo ""
 echo -e " \033[1;32m   Noyaux actuellement installés dans /boot :\033[0m"
 ls /boot 2>/dev/null | grep initrd | cut -d- -f2,3,4 | sed 's/^/\t/' || true
+echo ""
+
+echo -e "\t\033[0;33mℹ️  Note : Les noyaux Mainline très récents peuvent exiger des bibliothèques système (ex. libc6/libssl)\033[0m"
+echo -e "\t\033[0;33m   plus récentes que celles fournies par d'anciennes versions Ubuntu LTS.\033[0m"
 echo ""
 
 echo -e "    \033[1;4;36m--- Recherche des paquets distants sur le serveur ---\033[0m"
@@ -397,15 +402,12 @@ done
 
 if [ "$has_lowlatency" -eq 1 ]; then
     if ask_yn "\033[3m\tSouhaitez-vous installer la variante 'lowlatency' (y/n) ? \033[0m"; then
-        low=1
         choix="lowlatency"
     else
-        low=0
         choix="generic"
     fi
     echo ""
 else
-    low=0
     choix="generic"
     echo -e "\t\033[0;36mℹ️  Variante 'lowlatency' non disponible pour $site : sélection automatique de 'generic'.\033[0m"
     echo ""
@@ -475,7 +477,7 @@ echo -e "\t\033[1;4;92m  [Entrée] pour lancer le téléchargement et la vérifi
 echo -e "\t\033[1;31m  Ou [CTRL]-[C] pour annuler et quitter...\033[0m"
 
 while true; do
-    read -rsn1 key
+    read -rsn1 key || true
     [[ "$key" == "" ]] && break
 done
 
