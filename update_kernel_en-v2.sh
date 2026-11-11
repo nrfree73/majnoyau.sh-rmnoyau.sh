@@ -228,7 +228,14 @@ load_kernel_page() {
     fi
     versions_list=( "${all_versions[@]:$start_idx:$count}" )
     num_options=${#versions_list[@]}
-    cols=5
+
+    # Adapt column count dynamically to terminal width to prevent line wrapping
+    local term_cols
+    term_cols=$(tput cols 2>/dev/null || echo 120)
+    cols=$(( term_cols / 22 ))
+    [ "$cols" -lt 1 ] && cols=1
+    [ "$cols" -gt 5 ] && cols=5
+
     rows=$(( (num_options + cols - 1) / cols ))
 }
 
@@ -261,6 +268,16 @@ display_menu() {
     local r c idx
     local term_cols
     term_cols=$(tput cols 2>/dev/null || echo 120)
+
+    # Recalculate columns dynamically on redraw in case terminal was resized
+    local new_cols=$(( term_cols / 22 ))
+    [ "$new_cols" -lt 1 ] && new_cols=1
+    [ "$new_cols" -gt 5 ] && new_cols=5
+    if [ "$new_cols" -ne "$cols" ]; then
+        cols=$new_cols
+        rows=$(( (num_options + cols - 1) / cols ))
+    fi
+
     local grid_width=$(( cols * 21 ))
     local left_margin=$(( (term_cols - grid_width) / 2 ))
     [ $left_margin -lt 0 ] && left_margin=0
@@ -403,7 +420,8 @@ else
     echo ""
 fi
 
-if ls /boot/initrd.img-"${site2}"*-"${choix}" >/dev/null 2>&1; then
+# Exact version boundary check with hyphen after ${site2} to avoid prefix collisions (e.g. 6.1.1 vs 6.1.10)
+if ls /boot/initrd.img-"${site2}"-*-"${choix}" >/dev/null 2>&1; then
     echo -e " \033[1;31m   [ABORTED] Linux kernel $site ($choix) is already installed on your system!\033[0m"
     exit 0
 fi
@@ -497,7 +515,7 @@ mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
 KS_HOST="keyserver.ubuntu.com"
 UBUNTU_KERNEL_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
 if curl -fsSL --connect-timeout 5 --max-time 10 "https://${KS_HOST}/pks/lookup?op=get&options=mr&search=0x${UBUNTU_KERNEL_KEY}" -o key.asc 2>/dev/null && [ -s key.asc ]; then
-    if gpg --with-colons --import-options show-only --import key.asc 2>/dev/null | grep -q "fpr:::::::::${UBUNTU_KERNEL_KEY}:"; then
+    if gpg --with-colons --import-options show-only --import key.asc 2>/dev/null | grep -q "^fpr:.*:${UBUNTU_KERNEL_KEY}:"; then
         gpg --import key.asc >/dev/null 2>&1 || true
     else
         echo -e "\t\033[1;31m[SECURITY ALERT] Downloaded GPG key fingerprint mismatch! Aborting.\033[0m"
